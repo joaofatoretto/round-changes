@@ -10,7 +10,7 @@ Every file it touched, every diff (shell commands included), one key to open the
 [![License: MIT](https://img.shields.io/badge/license-MIT-3fb950)](LICENSE)
 [![Tested on Claude Code 2.1.293](https://img.shields.io/badge/tested_on-2.1.293-539bf5)](#requirements)
 
-<img src="screenshots/viewer-round.png" alt="The Round Changes viewer docked beside the chat, listing three files a round changed with M, DEL and NEW badges and their line counts" width="900">
+![The Round Changes viewer docked beside the chat, listing three files a round changed with M, DEL and NEW badges and their line counts](screenshots/viewer-round.png)
 
 </div>
 
@@ -69,7 +69,7 @@ Work with Claude as usual. When a round changes files, three ways in appear:
 | Prompt footer, right side | `3 files +7 −6` | The latest round |
 | Anywhere | `/changes` | The latest round |
 
-<img src="screenshots/chips.png" alt="A round's chip, '1 file +2 [ view ]', on the Baked for line, and the same counts at the right of the prompt footer" width="760">
+![A round's chip, '1 file +2 view', on the Baked for line, and the same counts at the right of the prompt footer](screenshots/chips.png)
 
 The viewer has two screens. **The round** lists every file it changed:
 
@@ -78,11 +78,11 @@ The viewer has two screens. **The round** lists every file it changed:
 
 **A file** shows its diff, one section per edit:
 
-<img src="screenshots/viewer-diff.png" alt="A file's diff in the viewer: an EDIT badge, buttons to open it in VS Code or find it in the chat, and the edit with added lines in green" width="760">
+![A file's diff in the viewer: an EDIT badge, buttons to open it in VS Code or find it in the chat, and the edit with added lines in green](screenshots/viewer-diff.png)
 
 Shell commands are diffed the same way, with the command that made the change shown above it:
 
-<img src="screenshots/viewer-shell.png" alt="A file deleted by a shell command: a DEL badge, a Shell section showing the command, and the removed lines in red" width="760">
+![A file deleted by a shell command: a DEL badge, a Shell section showing the command, and the removed lines in red](screenshots/viewer-shell.png)
 
 ### Keys
 
@@ -109,7 +109,7 @@ The viewer takes the keyboard when it opens. Click it, or press `ctrl+x` then `t
 - **Any other size:** it opens above the prompt, at full width and only as tall as it needs. Esc closes it.
 - **Narrow widths:** each row drops what doesn't fit, folders and size bars first, and keeps the file names and counts. It stays usable down to about 46 columns.
 
-<img src="screenshots/small-terminal.png" alt="The viewer above the prompt in a 64-column terminal, listing three files with their badges and counts" width="420">
+![The viewer above the prompt in a 64-column terminal, listing three files with their badges and counts](screenshots/small-terminal.png)
 
 Claude Code docks panels on the right only in its fullscreen layout at 110 columns or more. A mod can't change that.
 
