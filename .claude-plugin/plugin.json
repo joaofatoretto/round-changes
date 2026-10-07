@@ -1,0 +1,14 @@
+{
+  "name": "round-changes",
+  "version": "0.1.0",
+  "description": "Review what each round changed: the files Claude touched, their diffs (shell commands included), and one key to open a change in VS Code.",
+  "author": {
+    "name": "joaofatoretto",
+    "url": "https://github.com/joaofatoretto"
+  },
+  "homepage": "https://github.com/joaofatoretto/round-changes",
+  "repository": "https://github.com/joaofatoretto/round-changes",
+  "license": "MIT",
+  "keywords": ["mods", "diff", "review", "git", "vscode"],
+  "types": "./types/index.d.ts"
+}

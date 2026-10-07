@@ -1,0 +1,17 @@
+{
+  "name": "round-changes",
+  "owner": {
+    "name": "joaofatoretto",
+    "url": "https://github.com/joaofatoretto"
+  },
+  "metadata": {
+    "description": "Round Changes: review what each Claude Code round changed, with diffs and one key to open them in VS Code."
+  },
+  "plugins": [
+    {
+      "name": "round-changes",
+      "source": "./",
+      "description": "Review what each round changed: the files Claude touched, their diffs (shell commands included), and one key to open a change in VS Code."
+    }
+  ]
+}
