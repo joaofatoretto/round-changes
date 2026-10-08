@@ -24,6 +24,7 @@ Claude can change a dozen files in one reply, some with the Edit tool and some t
 - **Every kind of change:** Edit, Write and notebook edits are recorded as they happen. In a git repo, **shell commands are diffed too**, including new and deleted files.
 - **Clear diffs:** syntax-highlighted, with line numbers, one section per edit, and the command that made each shell change.
 - **Open in VS Code:** jumps to the first changed line, in the window you already have open.
+- **Audit in VS Code:** opens the project with every file the round touched, so the editor's git markers and Source Control view show each change in place.
 - **Find in chat:** scrolls the conversation back to the tool call that made the change.
 - **Takes no space until you want it:** a chip on each round's "✻ Worked for…" line and a button in the prompt footer open the viewer. Neither adds a row.
 - **Fits small terminals:** the layout adapts from 46 columns up, and Esc puts it away.
@@ -90,7 +91,8 @@ The viewer takes the keyboard when it opens. Click it, or press `ctrl+x` then `t
 
 | On the round | |
 |---|---|
-| `1`–`9` | Open that file's diff (or click its name) |
+| `1`–`9` | Open that file's diff (or click its row) |
+| `a` | Audit the round in VS Code |
 | `p` / `n` | Older / newer round |
 | `esc` | Close |
 
@@ -99,7 +101,7 @@ The viewer takes the keyboard when it opens. Click it, or press `ctrl+x` then `t
 | `o` | Open in VS Code at the changed line |
 | `t` | Find the change in the chat |
 | `p` / `n` | Previous / next file in the round |
-| `e` | Jump to the bottom of a long diff |
+| `g` / `e` | Jump to the top / bottom of a long diff |
 | `↑` `↓` | Scroll |
 | `b` or `esc` | Back to the round |
 
@@ -136,9 +138,10 @@ Round Changes makes no network requests and calls no model.
 
 | When | Command |
 |---|---|
-| First shell command of a session | `git rev-parse` to find the repo. `cp` seeds the private index, once. |
+| Shell commands, until a repo is found | `git rev-parse` to find the repo. `cp` seeds the private index, once. |
 | Around each shell command | `git add -A` and `git write-tree` with the private index, then `git diff` between the two snapshots |
 | When you press Open in VS Code | `code -r -g <file>:<line>` |
+| When you press Audit in VS Code | `code <project> -g <file>:<line> …` (up to 25 files) |
 
 Rounds live in the session's memory and end with it. When the mod loads in a session that's already running, it rebuilds earlier rounds from the transcript.
 

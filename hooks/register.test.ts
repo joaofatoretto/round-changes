@@ -3,6 +3,8 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Live, Round } from '../types'
 import {
   addedHunk,
+  auditCommand,
+  auditFitsBeside,
   capHunks,
   diffSource,
   displayPath,
@@ -95,6 +97,7 @@ const PANE_PROPS = {
 for (const surface of ['terminal', 'desktop'] as const) {
   test(`pane lists the files a round touched and opens one in VS Code on ${surface}`, async ($, on) => {
     mock.clock(on, { now: Date.parse('2026-10-07T12:00:00Z') })
+    on('session.cwd', () => ({ value: '/repo' }))
     const opened: string[][] = []
     on('process.run', ($, e) => {
       opened.push([...e.argv])
@@ -148,6 +151,11 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await pane.find({ text: '1-2' })).toBeDefined()
     expect(await pane.find({ text: 'p/n' })).toBeDefined()
     expect(await pane.find({ text: 'esc' })).toBeDefined()
+
+    // Audit: the project in VS Code, each file at its first changed line.
+    await pane.press({ key: 'audit' })
+    expect(opened.at(-1)).toEqual(['code', '/repo', '-g', '/repo/src/theme.ts:42', '/repo/src/dark.css:1'])
+    opened.length = 0
 
     // A file opens its own screen: badge, actions, the diff.
     await pane.press({ key: 'file:1' })
@@ -242,6 +250,27 @@ test('reads a git diff into files: modified, deleted, added, binary', () => {
   ])
   expect(files[1]?.hunks[0]).toEqual({ oldStart: 1, oldLines: 1, newStart: 0, newLines: 0, lines: ['-keep'] })
   expect(files[2]?.hunks[0]).toEqual({ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ['+new'] })
+})
+
+test('an audit opens the folder and the files still there, at most a cap of them', () => {
+  const touch = (path: string, kind: 'added' | 'modified' | 'deleted', line: number) => ({
+    path,
+    kind,
+    changes: [makeChange({ toolUseId: path, tool: 'Edit' }, [{ ...HUNK, newStart: line - 2 }])],
+  })
+  const files = [touch('/r/a.ts', 'modified', 42), touch('/r/gone.ts', 'deleted', 1), touch('/r/b.ts', 'added', 3), touch('/r/c.ts', 'modified', 7)]
+  expect(auditCommand('code', '/r', files)).toEqual({ argv: ['code', '/r', '-g', '/r/a.ts:42', '/r/b.ts:3', '/r/c.ts:7'], opened: 3, left: 0 })
+  expect(auditCommand('code', '/r', files, 2)).toEqual({ argv: ['code', '/r', '-g', '/r/a.ts:42', '/r/b.ts:3'], opened: 2, left: 1 })
+})
+
+test('the audit button sits on the summary line until the line is too narrow', () => {
+  let rounds: Round[] = []
+  for (const f of ['a', 'b']) rounds = recordChange(rounds, live('t1', 1), `/r/${f}.ts`, 'modified', change(f))
+  const round = rounds[0]!
+  // "2 files changed +4 −2" with "[ Audit in VS Code ]" at 50 columns, "[ Audit ]" at 40.
+  expect(auditFitsBeside(round, 50)).toBe(true)
+  expect(auditFitsBeside(round, 40)).toBe(true)
+  expect(auditFitsBeside(round, 30)).toBe(false)
 })
 
 test('a file created then deleted in one round reads deleted', () => {

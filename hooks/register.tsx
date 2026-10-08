@@ -3,6 +3,9 @@ import type { EngineInterface, Register, ToolCallInput, ToolCallResult } from 'c
 
 import type { Change, FileTouch, Live, Round, View } from '../types'
 import {
+  auditCommand,
+  auditFitsBeside,
+  auditLabel,
   clock,
   diffScreenRows,
   diffSource,
@@ -26,6 +29,7 @@ import {
   shownRound,
   sizeBar,
   splitPath,
+  summaryText,
   stepFile,
   stepRound,
   shellWarning,
@@ -231,6 +235,24 @@ async function openInEditor($: EngineInterface, path: string, line: number) {
     else {
       const why = (ran.stderr || ran.stdout).trim().split('\n')[0] || `exit code ${ran.exitCode}`
       $.ui.toast(`VS Code did not open ${name}: ${why}`)
+    }
+  } catch {
+    $.ui.toast(`Could not run \`${EDITOR}\`. Is the VS Code CLI on your PATH?`)
+  }
+}
+
+/** Opens the project in VS Code with the round's files, where the gutter marks what git sees changed. */
+async function auditInEditor($: EngineInterface, round: Round) {
+  const folder = (await repoFor($))?.top ?? (await $.session.cwd())
+  const { argv, opened, left } = auditCommand(EDITOR, folder, round.files)
+  try {
+    const ran = await $.process.run(argv, { timeoutMs: 20_000 })
+    if (ran.exitCode === 0) {
+      const more = left > 0 ? `; ${left} more in Source Control` : ''
+      $.ui.toast(`Opened ${splitPath(folder).name} with ${plural(opened, 'file')} in VS Code${more}`, { timeoutMs: 3000 })
+    } else {
+      const why = (ran.stderr || ran.stdout).trim().split('\n')[0] || `exit code ${ran.exitCode}`
+      $.ui.toast(`VS Code did not open the project: ${why}`)
     }
   } catch {
     $.ui.toast(`Could not run \`${EDITOR}\`. Is the VS Code CLI on your PATH?`)
@@ -768,13 +790,30 @@ export const register: Register = on => {
       </Box>
     )
 
+    // The round as a whole, in the editor: every file it left in place, beside git's markers.
+    // At the right end of the summary line, or under it when the line has no room.
+    const canAudit = round.files.some(f => f.kind !== 'deleted')
+    const auditButton = canAudit && (
+      <Button key="audit" hotkey="a" variant="primary" onPress={() => auditInEditor($, round)}>
+        {auditLabel(width)}
+      </Button>
+    )
+    const isAuditBeside = canAudit && auditFitsBeside(round, width)
     const summary = (
-      <Box key="summary" flexDirection="row" gap={1} marginTop={1} width={room}>
-        <Text key="count" bold>
-          {stats.files > 0 ? `${plural(stats.files, 'file')} changed` : 'No file changes recorded'}
-        </Text>
-        {stats.added > 0 && <Text key="a" color={ADDED}>{`+${stats.added}`}</Text>}
-        {stats.removed > 0 && <Text key="r" color={REMOVED}>{`−${stats.removed}`}</Text>}
+      <Box key="summary" flexDirection="row" justifyContent="space-between" marginTop={1} width={room}>
+        <Box key="totals" flexDirection="row" gap={1}>
+          <Text key="count" bold>
+            {summaryText(stats.files)}
+          </Text>
+          {stats.added > 0 && <Text key="a" color={ADDED}>{`+${stats.added}`}</Text>}
+          {stats.removed > 0 && <Text key="r" color={REMOVED}>{`−${stats.removed}`}</Text>}
+        </Box>
+        {isAuditBeside && auditButton}
+      </Box>
+    )
+    const audit = canAudit && !isAuditBeside && (
+      <Box key="audit" flexDirection="row" marginTop={1} width={room}>
+        {auditButton}
       </Box>
     )
 
@@ -837,6 +876,7 @@ export const register: Register = on => {
         {nav}
         {prompt}
         {summary}
+        {audit}
         {n > 0 && (
           <Box key="files" flexDirection="column" marginTop={1} width={room}>
             {rows}
@@ -845,6 +885,7 @@ export const register: Register = on => {
         {warning}
         {hints([
           ...(n > 0 ? [[n === 1 ? '1' : `1-${Math.min(9, n)}`, 'open'] as const] : []),
+          ...(canAudit ? [['a', 'audit'] as const] : []),
           ['p/n', 'round'],
           ...(scrolls(estimate) ? [['g/e', 'top/end'] as const] : []),
           ['esc', 'close'],

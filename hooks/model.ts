@@ -265,6 +265,21 @@ export const shellWarning = (shell: number, isOutsideRepo: boolean, narrow: bool
 /** The room the viewer's body has at a pane `width`: its sides are padded by one. */
 const bodyRoom = (width: number) => Math.max(22, width - 2)
 
+/** The round's summary line: how many files changed. Its counts follow it, colored. */
+export const summaryText = (files: number) =>
+  files > 0 ? `${files} file${files === 1 ? '' : 's'} changed` : 'No file changes recorded'
+
+export const auditLabel = (width: number) => (fitFor(width) === 'narrow' ? 'Audit' : 'Audit in VS Code')
+
+/** Whether the audit button fits at the right end of the summary line; if not, it takes a row under it. */
+export const auditFitsBeside = (round: Round, width: number): boolean => {
+  const { added, removed, files } = roundStats(round)
+  const summary =
+    summaryText(files).length + (added > 0 ? `+${added}`.length + 1 : 0) + (removed > 0 ? `−${removed}`.length + 1 : 0)
+  // `[ label ]`, and two cells at least between it and the summary.
+  return summary + 2 + auditLabel(width).length + 4 <= bodyRoom(width)
+}
+
 /**
  * The rows the viewer wants for what it shows, so it opens no taller than it needs;
  * `width` is the pane's body, about the docked column.
@@ -285,8 +300,9 @@ export const wantedRows = (
       ? 1 + (narrow ? 1 : Math.ceil(shellWarning(round.shellCommands, round.isOutsideRepo === true, false).length / room))
       : 0
   const hints = room >= 34 ? 1 : 2
-  // nav, blank, prompt, meta, blank, summary, [blank, files], [blank, warning], blank, hints
-  return 2 + prompt + (narrow ? 0 : 1) + 2 + (round.files.length > 0 ? 1 + round.files.length : 0) + warning + 1 + hints
+  const audit = round.files.some(f => f.kind !== 'deleted') && !auditFitsBeside(round, width) ? 2 : 0
+  // nav, blank, prompt, meta, blank, summary, [blank, audit], [blank, files], [blank, warning], blank, hints
+  return 2 + prompt + (narrow ? 0 : 1) + 2 + audit + (round.files.length > 0 ? 1 + round.files.length : 0) + warning + 1 + hints
 }
 
 /** The finished round whose length matches a "Baked for" line, within a moment's drift. */
@@ -458,6 +474,23 @@ export const fileRowLabel = (name: string, dir: string, counts: string, width: n
   const folder = dir !== '' && dirRoom > 3 ? `  ${shortDir(dir, dirRoom)}` : ''
   const left = `${shown}${folder}`
   return `${left}${' '.repeat(Math.max(1, width - left.length - counts.length))}${counts}`
+}
+
+/** Files an audit opens at most; the rest are in the editor's Source Control view. */
+export const MAX_AUDIT_FILES = 25
+
+/**
+ * The editor command that audits a round: the project folder (its window, if one is
+ * open, else a new one) and each file still there at its first changed line.
+ */
+export const auditCommand = (editor: string, folder: string, files: readonly FileTouch[], max = MAX_AUDIT_FILES) => {
+  const present = files.filter(f => f.kind !== 'deleted')
+  const opened = present.slice(0, max)
+  return {
+    argv: [editor, folder, '-g', ...opened.map(f => `${f.path}:${f.changes[0]?.line ?? 1}`)],
+    opened: opened.length,
+    left: present.length - opened.length,
+  }
 }
 
 /** One file of a `git diff` between two snapshots. */
