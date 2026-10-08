@@ -3,10 +3,12 @@ import type { EngineInterface, Register, ToolCallInput, ToolCallResult } from 'c
 
 import type { Change, FileTouch, Live, Round, View } from '../types'
 import {
+  clock,
   diffScreenRows,
   diffSource,
   displayPath,
   duration,
+  fileRowLabel,
   fileStats,
   fitFor,
   fromToolRecord,
@@ -26,7 +28,10 @@ import {
   splitPath,
   stepFile,
   stepRound,
+  shellWarning,
+  viewKey,
   wantedRows,
+  wrapLines,
 } from './model'
 
 const PANE = 'round-changes'
@@ -41,7 +46,7 @@ const turns = atom({ plugin: 'round-changes', key: 'turns' } as const, 0)
 const view = atom({ plugin: 'round-changes', key: 'view' } as const, { roundId: null, file: null, screen: 'round' })
 const cwd = atom({ plugin: 'round-changes', key: 'cwd' } as const, '')
 const home = atom({ plugin: 'round-changes', key: 'home' } as const, '')
-const noRepo = atom({ plugin: 'round-changes', key: 'noRepo' } as const, false)
+const scroll = atom({ plugin: 'round-changes', key: 'scroll' } as const, null)
 
 /** Git's colors for added and removed lines, as GitHub draws them. */
 const ADDED = '#3fb950'
@@ -134,13 +139,28 @@ async function diffTrees($: EngineInterface, repo: Repo, before: string, after: 
   return ran.exitCode === 0 ? ran.stdout : ''
 }
 
-// The repo is looked up once per load; snapshots run one at a time, as they share an index.
-let repoLookup: Promise<Repo | null> | undefined
+// Repos found, by the folder the session ran in. A miss is not kept, so a `git init`
+// or a move into a repo mid-session is seen at the next command; snapshots run one at
+// a time, as they share an index.
+const repos = new Map<string, Repo>()
 let queue: Promise<unknown> = Promise.resolve()
 
-function repoFor($: EngineInterface): Promise<Repo | null> {
-  repoLookup ??= $.session.cwd().then(dir => findRepo($, dir)).catch(() => null)
-  return repoLookup
+async function repoFor($: EngineInterface): Promise<Repo | null> {
+  try {
+    const dir = await $.session.cwd()
+    const known = repos.get(dir)
+    if (known) return known
+    const found = await findRepo($, dir)
+    if (found) repos.set(dir, found)
+    return found
+  } catch {
+    return null
+  }
+}
+
+/** Drops a repo whose snapshot failed (moved, renamed, removed), so the next command looks again. */
+function forgetRepo(repo: Repo) {
+  for (const [dir, known] of repos) if (known === repo) repos.delete(dir)
 }
 
 function oneAtATime<T>(work: () => Promise<T>): Promise<T> {
@@ -256,6 +276,15 @@ export const register: Register = on => {
     return {}
   })
 
+  // The window's moves, measured: the pills at its foot need the tree's true height.
+  on('ui.scroll', { requestId: PANE }, async ($, e, next) => {
+    const moved = await next(e)
+    if (moved.deny !== undefined) return moved
+    const key = viewKey(await read($, rounds), await read($, view))
+    await update($, scroll, () => ({ key, contentRows: e.contentRows }))
+    return moved
+  })
+
   // Esc on a file's diff steps back to the round; on the round it closes.
   on('ui.close', async ($, e, next) => {
     if (e.id !== PANE || e.origin.kind !== 'person') return next(e)
@@ -303,10 +332,10 @@ export const register: Register = on => {
       return ran
     }
     // No snapshot: the round still shows, with a warning that files may have changed unseen.
-    await update($, noRepo, () => repo === null)
+    if (repo) forgetRepo(repo)
     const into = await currentRound($)
     await update($, live, l => (l && l.id === into.id ? { ...l, shellCommands: l.shellCommands + 1 } : l))
-    await update($, rounds, list => countShell(list, into))
+    await update($, rounds, list => countShell(list, into, repo === null))
     return ran
   }).catch(passThrough)
 
@@ -328,7 +357,9 @@ export const register: Register = on => {
         <Box key="chip" flexDirection="row" gap={1} flexShrink={0}>
           {round.shellCommands > 0 && (
             <Text key="warn" color="yellow">
-              {s.files === 0 && counts ? 'no git: shell changes not tracked' : 'no git'}
+              {round.isOutsideRepo
+                ? s.files === 0 && counts ? 'no git: shell changes not tracked' : 'no git'
+                : s.files === 0 && counts ? 'shell changes not tracked' : 'untracked'}
             </Text>
           )}
           {counts && s.files > 0 && <Text key="files">{plural(s.files, 'file')}</Text>}
@@ -351,7 +382,7 @@ export const register: Register = on => {
     const s = roundStats(newest)
     const files = s.files > 0 ? plural(s.files, 'file') : 'shell changes'
     const counts = [s.added > 0 && `+${s.added}`, s.removed > 0 && `−${s.removed}`].filter(Boolean).join(' ')
-    const noGit = newest.shellCommands > 0 ? 'no git ' : ''
+    const noGit = newest.shellCommands > 0 ? (newest.isOutsideRepo ? 'no git ' : 'untracked ') : ''
     // The engine moves this slot to a row of its own when the hint leaves it no room, so
     // it drops the counts, then steps aside: the hint is about 52 columns, 71 while a turn runs.
     const columns = e.viewport?.columns ?? 0
@@ -370,16 +401,15 @@ export const register: Register = on => {
           </Text>
         )}
         <Box key="changes" flexDirection="row" gap={1}>
-          {noGit && (
+          {noGit !== '' && (
             <Text key="nogit" color="yellow">
-              no git
+              {noGit.trim()}
             </Text>
           )}
+          {/* One Button for the whole of it, counts included: a label holds no colors, but every cell presses. */}
           <Button key="footer-changes" plain dimColor onPress={() => showRound($, newest.id)}>
-            {files}
+            {withCounts ? `${files} ${counts}` : files}
           </Button>
-          {withCounts && s.added > 0 && <Text key="a" color={ADDED}>{`+${s.added}`}</Text>}
-          {withCounts && s.removed > 0 && <Text key="r" color={REMOVED}>{`−${s.removed}`}</Text>}
         </Box>
       </Box>
     )
@@ -395,28 +425,86 @@ export const register: Register = on => {
     const homeDir = await read($, home)
     const where = (path: string) => displayPath(path, root, homeDir)
     const width = Math.max(24, e.props.bodyColumns)
+    // The body is padded by one column at each side: what is drawn fits `room`.
+    const room = width - 2
     const fit = fitFor(width)
     const round = shownRound(list, v)
 
-    const keyHelp = (text: string) => (
-      <Text key="help" dimColor wrap="truncate-end">
-        {text}
+    /** A file's kind as a 3-cell chip: A added, M modified, D deleted. */
+    const kindBadge = (kind: FileTouch['kind']) => (
+      <Text key="badge" bold color="inverseText" backgroundColor={kind === 'deleted' ? 'error' : kind === 'added' ? 'success' : 'warning'}>
+        {kind === 'deleted' ? ' D ' : kind === 'added' ? ' A ' : ' M '}
       </Text>
+    )
+
+    /**
+     * Pills at the window's foot, as the chat's own: to the top once scrolled down, to the
+     * bottom while there is more below. `estimate` stands in for the tree's height until
+     * the window has moved on this screen and the engine has said it.
+     */
+    const measured = await read($, scroll)
+    const here = viewKey(list, v)
+    const known = measured?.key === here ? measured : undefined
+    const treeRows = (estimate: number) => known?.contentRows ?? estimate
+    const pills = (estimate: number) => {
+      const { bodyRows } = e.props.scroll
+      const total = treeRows(estimate)
+      const { offset } = e.props.scroll
+      const canTop = offset > 0
+      const canBottom = offset + bodyRows < total
+      if (!canTop && !canBottom) return null
+      const short = fit === 'narrow'
+      return (
+        <Box key="pills" position="absolute" top={offset + bodyRows - 1} right={1} flexDirection="row" gap={1}>
+          {canTop && (
+            <Button key="top" hotkey="g" variant="primary" onPress={() => scrollPane($, 'start')}>
+              {short ? '⤒' : '⤒ top'}
+            </Button>
+          )}
+          {canBottom && (
+            <Button key="bottom" hotkey="e" variant="primary" onPress={() => scrollPane($, 'end')}>
+              {short ? '⤓' : '⤓ bottom'}
+            </Button>
+          )}
+        </Box>
+      )
+    }
+    // A tree taller than its window ends in a blank row, under the pills at its foot.
+    const scrolls = (estimate: number) => treeRows(estimate) > e.props.scroll.bodyRows
+
+    /** The key hints at the foot: key in the accent, what it does dim, wrapping instead of cutting. */
+    const hints = (pairs: readonly (readonly [string, string])[]) => (
+      <Box key="hints" flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={1} width={room}>
+        {pairs.map(([key, label]) => (
+          <Box key={`hint:${key}`} flexDirection="row" gap={1}>
+            <Text key="key" bold color="claude">
+              {key}
+            </Text>
+            <Text key="label" dimColor>
+              {label}
+            </Text>
+          </Box>
+        ))}
+      </Box>
     )
 
     if (!round) {
       return (
-        <Box flexDirection="column" paddingX={1} width={width}>
+        <Box flexDirection="column" paddingX={1} paddingY={1} width={width}>
           <Text key="title" bold>
-            Nothing changed yet
+            No changes yet
           </Text>
-          <Text key="hint" dimColor>
-            When Claude edits or creates files, each round shows up here with its diffs.
-          </Text>
-          {running && (
-            <Text key="live" color="claude">
-              {`● Turn ${running.turn} is running`}
+          <Box key="about" marginTop={1}>
+            <Text key="hint" dimColor wrap="wrap">
+              When Claude edits, creates or deletes files, each round appears here with its diffs.
             </Text>
+          </Box>
+          {running && (
+            <Box key="running" marginTop={1}>
+              <Text key="live" color="claude">
+                {`● Turn ${running.turn} is running`}
+              </Text>
+            </Box>
           )}
         </Box>
       )
@@ -437,66 +525,73 @@ export const register: Register = on => {
       const canReveal = file.changes.some(c => !c.agentId)
       const many = round.files.length > 1
 
-      const nav = many && (
-        <Box key="files-nav" flexDirection="row" gap={1} flexShrink={0}>
-          <Button key="prev-file" plain hotkey="p" dimColor onPress={() => move($, (l, w) => stepFile(l, w, -1))}>
-            ◀
+      // Row 1: back at the left, the walk between the round's files at the right.
+      const nav = (
+        <Box key="nav" flexDirection="row" justifyContent="space-between" width={room}>
+          <Button key="back" plain hotkey="b" dimColor onPress={() => move($, (_, w) => ({ ...w, screen: 'round' }))}>
+            ◀ Back
           </Button>
-          <Text key="pos" dimColor>{`${at + 1}/${round.files.length}`}</Text>
-          <Button key="next-file" plain hotkey="n" dimColor onPress={() => move($, (l, w) => stepFile(l, w, 1))}>
-            ▶
-          </Button>
+          {many && (
+            <Box key="files-nav" flexDirection="row" gap={1} flexShrink={0}>
+              <Button key="prev-file" plain hotkey="p" dimColor onPress={() => move($, (l, w) => stepFile(l, w, -1))}>
+                ◀
+              </Button>
+              <Text key="pos" dimColor>{`${at + 1}/${round.files.length}`}</Text>
+              <Button key="next-file" plain hotkey="n" dimColor onPress={() => move($, (l, w) => stepFile(l, w, 1))}>
+                ▶
+              </Button>
+            </Box>
+          )}
         </Box>
       )
 
-      // Row 1: back, what the file is, how much changed; the file walk at the right.
-      const titleRow = (
-        <Box key="title" flexDirection="row" justifyContent="space-between" width={width}>
-          <Box key="left" flexDirection="row" gap={1} flexShrink={1} overflow="hidden">
-            <Button key="back" plain hotkey="b" dimColor onPress={() => move($, (_, w) => ({ ...w, screen: 'round' }))}>
-              ◀
-            </Button>
-            <Text key="badge" bold color="inverseText" backgroundColor={isGone ? 'error' : isNew ? 'success' : 'warning'}>
-              {isGone ? ' DEL ' : isNew ? ' NEW ' : ' EDIT '}
-            </Text>
-            <Text key="name" bold wrap="truncate-end">
-              {name}
-            </Text>
-            {fs.added > 0 && <Text key="a" color={ADDED}>{`+${fs.added}`}</Text>}
-            {fs.removed > 0 && <Text key="r" color={REMOVED}>{`−${fs.removed}`}</Text>}
+      // What the file is, how much changed, and where it lives.
+      const title = (
+        <Box key="title" flexDirection="column" marginTop={1} width={room}>
+          <Box key="what" flexDirection="row" justifyContent="space-between" gap={1} width={room}>
+            <Box key="who" flexDirection="row" gap={1} flexShrink={1} overflow="hidden">
+              {kindBadge(file.kind)}
+              <Text key="name" bold wrap="truncate-end">
+                {name}
+              </Text>
+            </Box>
+            <Box key="counts" flexDirection="row" gap={1} flexShrink={0}>
+              {fs.added > 0 && <Text key="a" color={ADDED}>{`+${fs.added}`}</Text>}
+              {fs.removed > 0 && <Text key="r" color={REMOVED}>{`−${fs.removed}`}</Text>}
+            </Box>
           </Box>
-          {nav}
+          {dir !== '' && (
+            <Box key="where" paddingLeft={4}>
+              <Text key="dir" dimColor wrap="truncate-start">
+                {shortDir(dir, room - 4)}
+              </Text>
+            </Box>
+          )}
         </Box>
       )
 
-      // Row 2: the folder, and the two things to do with the file.
-      const openLabel = isGone ? '' : fit === 'narrow' ? 'VS Code' : 'Open in VS Code'
+      // The two things to do with the file.
+      const openLabel = fit === 'narrow' ? 'VS Code' : 'Open in VS Code'
       const chatLabel = fit === 'narrow' ? 'chat' : 'Find in chat'
-      const actionsWidth = (isGone ? 0 : openLabel.length + 6) + (canReveal ? chatLabel.length + 7 : 0)
-      const actionRow = (
-        <Box key="actions" flexDirection="row" justifyContent="space-between" width={width}>
-          <Text key="dir" dimColor>
-            {shortDir(dir, width - actionsWidth - 2)}
-          </Text>
-          <Box key="do" flexDirection="row" gap={1} flexShrink={0}>
-            {!isGone && (
-              <Button key="open" hotkey="o" variant="primary" onPress={() => openInEditor($, file.path, file.changes[0]?.line ?? 1)}>
-                {openLabel}
-              </Button>
-            )}
-            {canReveal && (
-              <Button
-                key="reveal"
-                hotkey="t"
-                onPress={() => {
-                  const first = file.changes.find(c => !c.agentId)
-                  if (first) void revealInChat($, first)
-                }}
-              >
-                {chatLabel}
-              </Button>
-            )}
-          </Box>
+      const actions = (!isGone || canReveal) && (
+        <Box key="actions" flexDirection="row" gap={2} marginTop={1} width={room}>
+          {!isGone && (
+            <Button key="open" hotkey="o" variant="primary" onPress={() => openInEditor($, file.path, file.changes[0]?.line ?? 1)}>
+              {openLabel}
+            </Button>
+          )}
+          {canReveal && (
+            <Button
+              key="reveal"
+              hotkey="t"
+              onPress={() => {
+                const first = file.changes.find(c => !c.agentId)
+                if (first) void revealInChat($, first)
+              }}
+            >
+              {chatLabel}
+            </Button>
+          )}
         </Box>
       )
 
@@ -509,32 +604,49 @@ export const register: Register = on => {
                 ? 'Created'
                 : 'Rewritten'
               : 'Edit'
-        const label = file.changes.length > 1 ? `${what} ${ci + 1}/${file.changes.length}` : what
+        const several = file.changes.length > 1
+        const label = several ? `${what} ${ci + 1} of ${file.changes.length}` : what
+        const line = `· line ${c.line}`
+        const agent = fit !== 'narrow' && c.agentId ? '· subagent' : ''
+        const hasOpen = several && !isGone
+        const hasChat = several && !c.agentId && fit !== 'narrow'
+        const buttonsWidth = (hasOpen ? 6 : 0) + (hasChat ? 6 : 0) + (hasOpen && hasChat ? 2 : 0)
+        // The rule runs from the label to the buttons (or the edge), one space between each part.
+        const parts = [2, label.length, line.length, ...(agent ? [agent.length] : []), ...(buttonsWidth > 0 ? [buttonsWidth] : [])]
+        // One cell spare: a rule that fills the row exactly is cut with an ellipsis.
+        const fill = room - parts.reduce((n, p) => n + p, 0) - parts.length - 1
         return (
-          <Box key={`edit:${ci}`} flexDirection="column" width={width}>
-            <Box key="head" flexDirection="row" justifyContent="space-between" width={width}>
-              <Box key="what" flexDirection="row" gap={1}>
-                <Text key="bar" color="claude">
-                  ▍
+          <Box key={`edit:${ci}`} flexDirection="column" marginTop={1} width={room}>
+            <Box key="head" flexDirection="row" gap={1} width={room}>
+              <Text key="lead" dimColor>
+                ──
+              </Text>
+              <Text key="label" bold>
+                {label}
+              </Text>
+              <Text key="line" dimColor>
+                {line}
+              </Text>
+              {agent !== '' && (
+                <Text key="agent" dimColor>
+                  {agent}
                 </Text>
-                <Text key="label" bold>
-                  {label}
-                </Text>
-                <Text key="line" dimColor>{`· line ${c.line}`}</Text>
-                {fit !== 'narrow' && c.agentId && (
-                  <Text key="agent" dimColor>
-                    · subagent
+              )}
+              {fill > 0 && (
+                <Box key="rule" flexGrow={1} flexShrink={1} overflow="hidden">
+                  <Text key="dashes" dimColor wrap="truncate-end">
+                    {'─'.repeat(fill)}
                   </Text>
-                )}
-              </Box>
-              {file.changes.length > 1 && (
-                <Box key="go" flexDirection="row" gap={2}>
-                  {!isGone && (
+                </Box>
+              )}
+              {buttonsWidth > 0 && (
+                <Box key="go" flexDirection="row" gap={2} flexShrink={0}>
+                  {hasOpen && (
                     <Button key={`open:${ci}`} plain dimColor onPress={() => openInEditor($, file.path, c.line)}>
                       ↗ open
                     </Button>
                   )}
-                  {!c.agentId && fit !== 'narrow' && (
+                  {hasChat && (
                     <Button key={`reveal:${ci}`} plain dimColor onPress={() => revealInChat($, c)}>
                       ⌖ chat
                     </Button>
@@ -542,7 +654,7 @@ export const register: Register = on => {
                 </Box>
               )}
             </Box>
-            {c.command && (
+            {!!c.command && (
               <Text key="cmd" dimColor wrap="truncate-end">
                 {`  $ ${c.command.replace(/\s+/g, ' ')}`}
               </Text>
@@ -550,7 +662,7 @@ export const register: Register = on => {
             {c.hunks.length > 0 && (
               <Code key="diff" format="diff" source={diffSource(c.hunks)} path={file.path} language={c.language} />
             )}
-            {c.note && (
+            {!!c.note && (
               <Text key="note" dimColor italic>
                 {c.note}
               </Text>
@@ -564,142 +676,145 @@ export const register: Register = on => {
         )
       })
 
-      // Like the chat's own: a pill at the window's foot while there is more below.
-      const { offset, bodyRows } = e.props.scroll
-      const moreBelow = diffScreenRows(file, width) - (offset + bodyRows)
-      const jump = moreBelow > 0 && (
-        <Box key="jump" position="absolute" top={offset + bodyRows - 1} right={1}>
-          <Button key="bottom" hotkey="e" variant="primary" onPress={() => scrollPane($, 'end')}>
-            {fit === 'narrow' ? '⤓' : '⤓ jump to bottom'}
-          </Button>
-        </Box>
-      )
+      const estimate = diffScreenRows(file, width, dir !== '')
 
       return (
-        <Box flexDirection="column" width={width}>
-          {titleRow}
-          {actionRow}
+        <Box flexDirection="column" paddingX={1} paddingBottom={scrolls(estimate) ? 1 : 0} width={width}>
+          {nav}
+          {title}
+          {actions}
           {edits}
-          {keyHelp(
-            fit === 'narrow'
-              ? 'o code · t chat · esc back'
-              : `o VS Code · t find in chat · ${many ? 'p/n file · ' : ''}↑↓ scroll · e bottom · esc back`,
-          )}
-          {jump}
+          {hints([
+            ...(!isGone ? [['o', 'open'] as const] : []),
+            ...(canReveal ? [['t', 'chat'] as const] : []),
+            ...(many ? [['p/n', 'file'] as const] : []),
+            ...(scrolls(estimate) ? [['g/e', 'top/end'] as const] : []),
+            ['esc', 'back'],
+          ])}
+          {pills(estimate)}
         </Box>
       )
     }
 
     // ── Screen 1: the round's overview ──────────────────────────────
-    // Row 1: older ◀ ROUND ▶ newer, the totals, and when.
-    const header = (
-      <Box key="nav" flexDirection="row" justifyContent="space-between" width={width}>
-        <Box key="steps" flexDirection="row" gap={1}>
-          {index > 0 ? (
-            <Button key="older" plain hotkey="p" onPress={() => move($, (l, w) => stepRound(l, w, -1))}>
-              ◀
-            </Button>
-          ) : (
-            <Text key="older-off" dimColor>
-              {'   ◀'}
-            </Text>
-          )}
-          <Text key="where" bold color="inverseText" backgroundColor="claude">
-            {` ROUND ${index + 1}/${list.length} `}
-          </Text>
-          {index < list.length - 1 ? (
-            <Button key="newer" plain hotkey="n" onPress={() => move($, (l, w) => stepRound(l, w, 1))}>
-              ▶
-            </Button>
-          ) : (
-            <Text key="newer-off" dimColor>
-              {'▶   '}
-            </Text>
-          )}
-          <Text key="files" bold>
-            {stats.files > 0 ? ` ${plural(stats.files, 'file')}` : ' no tracked files'}
-          </Text>
-          {stats.added > 0 && <Text key="a" color={ADDED}>{`+${stats.added}`}</Text>}
-          {stats.removed > 0 && <Text key="r" color={REMOVED}>{`−${stats.removed}`}</Text>}
-        </Box>
-        {isLive ? (
-          <Text key="when" color="claude">
-            ● working
-          </Text>
+    // Row 1: older ◀ which round ▶ newer.
+    const isLatest = index === list.length - 1
+    const nav = (
+      <Box key="nav" flexDirection="row" justifyContent="space-between" width={room}>
+        {index > 0 ? (
+          <Button key="older" plain hotkey="p" onPress={() => move($, (l, w) => stepRound(l, w, -1))}>
+            ◀
+          </Button>
         ) : (
-          fit === 'wide' && (
-            <Text key="when" dimColor>
-              {`turn ${round.turn}` +
-                (round.durationMs ? ` · ${duration(round.durationMs)}` : round.startedAt === 0 ? ' · earlier' : '')}
+          <Text key="older-off" dimColor>
+            {'   ◀'}
+          </Text>
+        )}
+        <Box key="where" flexDirection="row" gap={1}>
+          <Text key="round" bold color="claude">
+            {`Round ${index + 1} of ${list.length}`}
+          </Text>
+          {isLive ? (
+            <Text key="tag" color="claude">
+              ● working
             </Text>
-          )
+          ) : (
+            isLatest && (
+              <Text key="tag" dimColor>
+                latest
+              </Text>
+            )
+          )}
+        </Box>
+        {index < list.length - 1 ? (
+          <Button key="newer" plain hotkey="n" onPress={() => move($, (l, w) => stepRound(l, w, 1))}>
+            ▶
+          </Button>
+        ) : (
+          <Text key="newer-off" dimColor>
+            {'▶   '}
+          </Text>
         )}
       </Box>
     )
 
+    // The prompt, up to two lines behind an accent bar; under it, which turn, how long, when.
+    const meta = [
+      `turn ${round.turn}`,
+      round.durationMs ? duration(round.durationMs) : '',
+      round.startedAt > 0 ? clock(round.startedAt) : 'earlier',
+    ]
+      .filter(Boolean)
+      .join(' · ')
     const prompt = (
-      <Text key="prompt" italic wrap="truncate-end">
-        {`“${keepStart(promptLine(round.prompt), Math.max(10, width * 2 - 4))}”`}
-      </Text>
+      <Box key="prompt" flexDirection="column" marginTop={1} width={room}>
+        {wrapLines(promptLine(round.prompt), room - 2, 2).map((line, i) => (
+          <Box key={`prompt:${i}`} flexDirection="row" gap={1}>
+            <Text key="bar" color="claude">
+              ▎
+            </Text>
+            <Text key="text" italic wrap="truncate-end">
+              {line}
+            </Text>
+          </Box>
+        ))}
+        {fit !== 'narrow' && (
+          <Box key="meta" paddingLeft={2}>
+            <Text key="text" dimColor>
+              {meta}
+            </Text>
+          </Box>
+        )}
+      </Box>
+    )
+
+    const summary = (
+      <Box key="summary" flexDirection="row" gap={1} marginTop={1} width={room}>
+        <Text key="count" bold>
+          {stats.files > 0 ? `${plural(stats.files, 'file')} changed` : 'No file changes recorded'}
+        </Text>
+        {stats.added > 0 && <Text key="a" color={ADDED}>{`+${stats.added}`}</Text>}
+        {stats.removed > 0 && <Text key="r" color={REMOVED}>{`−${stats.removed}`}</Text>}
+      </Box>
     )
 
     const shell = round.shellCommands
-    const isGitless = await read($, noRepo)
     const warning = shell > 0 && (
-      <Text key="warning" color="warning" wrap={fit === 'narrow' ? 'truncate-end' : 'wrap'}>
-        {fit === 'narrow'
-          ? `⚠ ${isGitless ? 'No git' : 'Untracked'}: ${plural(shell, 'shell command')} not shown`
-          : isGitless
-            ? `⚠ Not a git repo: ${plural(shell, 'shell command')} may have changed files that can't be shown here. Run git init to see them.`
-            : `⚠ ${plural(shell, 'shell command')} ran while the work tree could not be snapshotted: their changes are not shown.`}
-      </Text>
+      <Box key="warning" marginTop={1} width={room}>
+        <Text key="text" color="warning" wrap={fit === 'narrow' ? 'truncate-end' : 'wrap'}>
+          {shellWarning(shell, round.isOutsideRepo === true, fit === 'narrow')}
+        </Text>
+      </Box>
     )
 
-    // One row per file: number + name to click, folder, badge, counts, size bar.
+    // One row per file: its kind, then one Button from the number to the counts, so a
+    // click anywhere on the row opens it (a label holds no colors; the badge and the
+    // size bar after it keep theirs).
     const largest = Math.max(1, ...round.files.map(f => fileStats(f).added + fileStats(f).removed))
-    const statsWidth = 11
-    const badgeWidth = 5
-    const barWidth = fit === 'wide' ? 7 : 0
-    const nameRoom = width - 4 - statsWidth - badgeWidth - barWidth
+    const badgeWidth = 3
+    const barWidth = fit === 'narrow' ? 0 : 5
+    const labelRoom = room - badgeWidth - 1 - 3 - (barWidth > 0 ? barWidth + 1 : 0)
     const rows = round.files.map((f, i) => {
       const { dir, name } = splitPath(where(f.path))
       const s = fileStats(f)
-      const bar = sizeBar(s.added, s.removed, largest)
-      const nameText = keepStart(name, Math.max(6, fit === 'wide' ? Math.min(28, nameRoom) : nameRoom))
-      const dirRoom = nameRoom - nameText.length - 1
+      const bar = sizeBar(s.added, s.removed, largest, barWidth)
+      const counts = s.added + s.removed === 0 ? '±0' : [s.added > 0 && `+${s.added}`, s.removed > 0 && `−${s.removed}`].filter(Boolean).join(' ')
+      const hotkey = i < 9 ? String(i + 1) : undefined
+      // A row past the ninth has no `n: ` before it: three spaces keep it in line.
+      const label = `${hotkey ? '' : '   '}${fileRowLabel(name, fit === 'narrow' ? '' : dir, counts, labelRoom)}`
       return (
-        <Box key={`row:${i}`} flexDirection="row" width={width}>
-          <Box key="pick" flexDirection="row" flexGrow={1} flexShrink={1} gap={1} overflow="hidden">
-            <Button
-              key={`file:${i}`}
-              plain
-              hotkey={i < 9 ? String(i + 1) : undefined}
-              onPress={() => move($, (_, w) => ({ roundId: w.roundId, file: f.path, screen: 'file' }))}
-            >
-              {nameText}
-            </Button>
-            {fit !== 'narrow' && dirRoom > 3 && (
-              <Text key="dir" dimColor wrap="truncate-start">
-                {shortDir(dir, dirRoom)}
-              </Text>
-            )}
-          </Box>
-          <Box key="kind" width={badgeWidth} flexShrink={0} justifyContent="flex-end">
-            <Text key="badge" color={f.kind === 'added' ? 'success' : f.kind === 'deleted' ? 'error' : 'warning'} bold>
-              {f.kind === 'added' ? 'NEW' : f.kind === 'deleted' ? 'DEL' : 'M'}
-            </Text>
-          </Box>
-          <Box key="nums" width={statsWidth} flexShrink={0} justifyContent="flex-end" gap={1}>
-            {s.added > 0 && <Text key="a" color={ADDED}>{`+${s.added}`}</Text>}
-            {s.removed > 0 && <Text key="r" color={REMOVED}>{`−${s.removed}`}</Text>}
-            {s.added + s.removed === 0 && (
-              <Text key="z" dimColor>
-                ±0
-              </Text>
-            )}
-          </Box>
+        <Box key={`row:${i}`} flexDirection="row" gap={1} width={room}>
+          {kindBadge(f.kind)}
+          <Button
+            key={`file:${i}`}
+            plain
+            hotkey={hotkey}
+            onPress={() => move($, (_, w) => ({ roundId: w.roundId, file: f.path, screen: 'file' }))}
+          >
+            {label}
+          </Button>
           {barWidth > 0 && (
-            <Box key="bar" width={barWidth} flexShrink={0} justifyContent="flex-end">
+            <Box key="bar" width={barWidth} flexShrink={0}>
               <Text key="p" color={ADDED}>
                 {'■'.repeat(bar.plus)}
               </Text>
@@ -716,20 +831,25 @@ export const register: Register = on => {
     })
 
     const n = round.files.length
-    const pick = n === 1 ? '1 diff' : `1-${Math.min(9, n)} diff`
+    const estimate = wantedRows(round, undefined, 'round', width)
     return (
-      <Box flexDirection="column" width={width}>
-        {header}
+      <Box flexDirection="column" paddingX={1} paddingBottom={scrolls(estimate) ? 1 : 0} width={width}>
+        {nav}
         {prompt}
-        {warning}
-        {rows}
-        {keyHelp(
-          n === 0
-            ? 'p/n older/newer round · esc close'
-            : fit === 'narrow'
-              ? `${pick} · p/n round · esc`
-              : `click a file or ${pick} · p/n older/newer round · esc close`,
+        {summary}
+        {n > 0 && (
+          <Box key="files" flexDirection="column" marginTop={1} width={room}>
+            {rows}
+          </Box>
         )}
+        {warning}
+        {hints([
+          ...(n > 0 ? [[n === 1 ? '1' : `1-${Math.min(9, n)}`, 'open'] as const] : []),
+          ['p/n', 'round'],
+          ...(scrolls(estimate) ? [['g/e', 'top/end'] as const] : []),
+          ['esc', 'close'],
+        ])}
+        {pills(estimate)}
       </Box>
     )
   })

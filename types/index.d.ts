@@ -43,8 +43,10 @@ export type Round = {
   files: FileTouch[]
   /** The turn's length as turn.complete reported it: what finds its "Baked for" line. */
   durationMs?: number
-  /** Shell commands run this round outside a git repo, whose changes could not be captured. */
+  /** Shell commands run this round whose changes could not be captured. */
   shellCommands: number
+  /** Some of them ran outside any git repo (the rest, if any, failed to snapshot). */
+  isOutsideRepo?: boolean
 }
 
 /** The turn running now, before or after its first change. */
@@ -71,8 +73,8 @@ declare module 'claude-code' {
       view: View
       cwd: string
       home: string
-      /** The session's folder is not in a git repo, so shell commands' changes cannot be captured. */
-      noRepo: boolean
+      /** The viewer's tree height as the engine measured it at the last scroll, and on which screen (`viewKey`). */
+      scroll: { key: string; contentRows: number } | null
     }
   }
 }

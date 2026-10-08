@@ -127,10 +127,14 @@ export const recordChange = (
     : [...rounds, next].slice(-MAX_ROUNDS)
 }
 
-/** Counts one shell command whose changes could not be captured, opening the round if it has none yet. */
-export const countShell = (rounds: readonly Round[], live: Live): Round[] => {
+/**
+ * Counts one shell command whose changes could not be captured, opening the round
+ * if it has none yet; `outsideRepo` when the folder was in no git repo at the time.
+ */
+export const countShell = (rounds: readonly Round[], live: Live, outsideRepo = false): Round[] => {
   const existing = rounds.find(r => r.id === live.id)
-  if (existing) return rounds.map(r => (r === existing ? { ...r, shellCommands: r.shellCommands + 1 } : r))
+  const mark = outsideRepo ? { isOutsideRepo: true } : {}
+  if (existing) return rounds.map(r => (r === existing ? { ...r, ...mark, shellCommands: r.shellCommands + 1 } : r))
   const round: Round = {
     id: live.id,
     turn: live.turn,
@@ -138,6 +142,7 @@ export const countShell = (rounds: readonly Round[], live: Live): Round[] => {
     startedAt: live.startedAt,
     files: [],
     shellCommands: 1,
+    ...mark,
   }
   return [...rounds, round].slice(-MAX_ROUNDS)
 }
@@ -165,6 +170,13 @@ export const shownRound = (rounds: readonly Round[], view: View): Round | undefi
 /** The file the view shows in `round`: the one it names, else the first. */
 export const shownFile = (round: Round | undefined, view: View): FileTouch | undefined =>
   round && ((view.file !== null && round.files.find(f => f.path === view.file)) || round.files[0])
+
+/** Names what the viewer shows (round, screen, file), so a measure of one screen is not read on another. */
+export const viewKey = (rounds: readonly Round[], view: View): string => {
+  const round = shownRound(rounds, view)
+  const file = view.screen === 'file' ? shownFile(round, view) : undefined
+  return `${round?.id ?? ''}:${view.screen}:${file?.path ?? ''}`
+}
 
 /** The view one round older (-1) or newer (+1), on its overview; the newest is followed again. */
 export const stepRound = (rounds: readonly Round[], view: View, by: number): View => {
@@ -213,12 +225,68 @@ export const keepEnd = (text: string, width: number): string =>
 export const keepStart = (text: string, width: number): string =>
   width <= 0 ? '' : text.length <= width ? text : `${text.slice(0, width - 1)}…`
 
-/** The rows the viewer wants for what it shows, so it opens no taller than it needs. */
-export const wantedRows = (round: Round | undefined, file: FileTouch | undefined, screen: View['screen']): number => {
+/**
+ * The prompt as at most `maxLines` rows of `width` cells, cut at spaces, the last
+ * row ending in … when more was left.
+ */
+export const wrapLines = (text: string, width: number, maxLines: number): string[] => {
+  const room = Math.max(1, width)
+  const lines: string[] = []
+  let rest = text.trim()
+  while (rest !== '' && lines.length < maxLines) {
+    if (rest.length <= room) {
+      lines.push(rest)
+      break
+    }
+    if (lines.length === maxLines - 1) {
+      lines.push(keepStart(rest, room))
+      break
+    }
+    let cut = rest.lastIndexOf(' ', room)
+    if (cut <= 0) cut = room
+    lines.push(rest.slice(0, cut).trimEnd())
+    rest = rest.slice(cut).trimStart()
+  }
+  return lines.length > 0 ? lines : ['']
+}
+
+const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`
+
+/** The warning for shell commands whose changes could not be shown; short when `narrow`. */
+export const shellWarning = (shell: number, isOutsideRepo: boolean, narrow: boolean): string => {
+  const commands = plural(shell, 'shell command')
+  if (narrow) return `⚠ ${isOutsideRepo ? 'No git' : 'Untracked'}: ${commands} not shown`
+  const its = shell === 1 ? 'its' : 'their'
+  return isOutsideRepo
+    ? `⚠ ${commands} ran outside a git repo, so ${its} changes can't be shown. Run git init to track them.`
+    : `⚠ ${commands} couldn't be snapshotted, so ${its} changes aren't shown.`
+}
+
+/** The room the viewer's body has at a pane `width`: its sides are padded by one. */
+const bodyRoom = (width: number) => Math.max(22, width - 2)
+
+/**
+ * The rows the viewer wants for what it shows, so it opens no taller than it needs;
+ * `width` is the pane's body, about the docked column.
+ */
+export const wantedRows = (
+  round: Round | undefined,
+  file: FileTouch | undefined,
+  screen: View['screen'],
+  width = 50,
+): number => {
   if (!round) return 6
-  if (screen === 'round' || !file) return round.files.length + 4 + (round.shellCommands > 0 ? 2 : 0)
-  const diffRows = file.changes.reduce((n, c) => n + 1 + c.hunks.reduce((m, h) => m + h.lines.length + 1, 0), 0)
-  return diffRows + 3
+  if (screen !== 'round' && file) return diffScreenRows(file, width)
+  const room = bodyRoom(width)
+  const narrow = fitFor(width) === 'narrow'
+  const prompt = wrapLines(promptLine(round.prompt), room - 2, 2).length
+  const warning =
+    round.shellCommands > 0
+      ? 1 + (narrow ? 1 : Math.ceil(shellWarning(round.shellCommands, round.isOutsideRepo === true, false).length / room))
+      : 0
+  const hints = room >= 34 ? 1 : 2
+  // nav, blank, prompt, meta, blank, summary, [blank, files], [blank, warning], blank, hints
+  return 2 + prompt + (narrow ? 0 : 1) + 2 + (round.files.length > 0 ? 1 + round.files.length : 0) + warning + 1 + hints
 }
 
 /** The finished round whose length matches a "Baked for" line, within a moment's drift. */
@@ -379,6 +447,19 @@ export const shortDir = (dir: string, width: number): string => {
   return kept === '' ? keepEnd(dir, width) : `…/${kept}`
 }
 
+/**
+ * A file row as one line of `width` cells: the name, its folder when there is room,
+ * and the counts at the right end. The name gives way last.
+ */
+export const fileRowLabel = (name: string, dir: string, counts: string, width: number): string => {
+  const nameRoom = Math.max(4, width - counts.length - 2)
+  const shown = keepStart(name, nameRoom)
+  const dirRoom = width - shown.length - counts.length - 4
+  const folder = dir !== '' && dirRoom > 3 ? `  ${shortDir(dir, dirRoom)}` : ''
+  const left = `${shown}${folder}`
+  return `${left}${' '.repeat(Math.max(1, width - left.length - counts.length))}${counts}`
+}
+
 /** One file of a `git diff` between two snapshots. */
 export type DiffFile = { path: string; kind: FileTouch['kind']; hunks: Hunk[]; isBinary: boolean }
 
@@ -423,13 +504,20 @@ export const parseGitDiff = (text: string): DiffFile[] => {
   return files
 }
 
-/** About how many rows a file's diff screen draws at `width`, wrapped lines counted. */
-export const diffScreenRows = (file: FileTouch, width: number): number => {
-  const room = Math.max(10, width - 7)
-  let rows = 3
+/**
+ * About how many rows a file's diff screen draws at `width`, wrapped lines counted:
+ * the nav, title, folder and actions, each change under its rule, the key hints.
+ */
+export const diffScreenRows = (file: FileTouch, width: number, hasDir = true): number => {
+  const room = bodyRoom(width)
+  const code = Math.max(10, width - 9)
+  const hasActions = file.kind !== 'deleted' || file.changes.some(c => !c.agentId)
+  // nav, blank, title, [folder], [blank, actions], blank, hints
+  let rows = 3 + (hasDir ? 1 : 0) + (hasActions ? 2 : 0) + 1 + (room >= 48 ? 1 : 2)
   for (const c of file.changes) {
-    rows += 1 + (c.command ? 1 : 0) + (c.note ? 1 : 0) + (c.isTruncated ? 1 : 0)
-    for (const h of c.hunks) for (const l of h.lines) rows += Math.max(1, Math.ceil(l.length / room))
+    // blank, rule, [command], [note], [cut note], the diff
+    rows += 2 + (c.command ? 1 : 0) + (c.note ? 1 : 0) + (c.isTruncated ? 1 : 0)
+    for (const h of c.hunks) for (const l of h.lines) rows += Math.max(1, Math.ceil(l.length / code))
   }
   return rows
 }

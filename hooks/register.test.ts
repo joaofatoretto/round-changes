@@ -139,15 +139,19 @@ for (const surface of ['terminal', 'desktop'] as const) {
       props: PANE_PROPS,
     })
     // The overview: the round, its totals, one clickable row per file.
-    expect(await pane.find({ text: ' ROUND 1/1 ' })).toBeDefined()
-    expect(await pane.find({ text: ' 2 files' })).toBeDefined()
+    expect(await pane.find({ text: 'Round 1 of 1' })).toBeDefined()
+    expect(await pane.find({ text: '2 files changed' })).toBeDefined()
     expect(await pane.find({ key: 'file:0' })).toBeDefined()
     expect(await pane.find({ key: 'file:1' })).toBeDefined()
-    expect(await pane.find({ text: 'NEW' })).toBeDefined()
+    expect(await pane.find({ text: ' A ' })).toBeDefined()
+    // The footer hints: the key to open a file, the round walk, close.
+    expect(await pane.find({ text: '1-2' })).toBeDefined()
+    expect(await pane.find({ text: 'p/n' })).toBeDefined()
+    expect(await pane.find({ text: 'esc' })).toBeDefined()
 
     // A file opens its own screen: badge, actions, the diff.
     await pane.press({ key: 'file:1' })
-    expect(await pane.find({ text: ' NEW ' })).toBeDefined()
+    expect(await pane.find({ text: ' A ' })).toBeDefined()
     expect(await pane.find({ text: 'Created' })).toBeDefined()
     expect(await pane.find({ key: 'file:0' })).toBeUndefined()
 
@@ -156,7 +160,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
     await pane.press({ key: 'prev-file' })
     expect(await pane.find({ text: '· line 42' })).toBeDefined()
-    expect(await pane.find({ text: ' EDIT ' })).toBeDefined()
+    expect(await pane.find({ text: ' M ' })).toBeDefined()
 
     await pane.press({ key: 'back' })
     expect(await pane.find({ key: 'file:0' })).toBeDefined()
@@ -262,9 +266,9 @@ test('a shell command that changes files shows its diffs, deletions included', a
   await $.tool.call({ tool: 'Bash', command: "sed -i 's/b/B/' src/x.txt && rm y.txt && echo new > z.txt" })
 
   const pane = await $.ui.mount({ plugin: 'round-changes', surface: 'terminal', component: 'Pane', requestId: 'round-changes', props: PANE_PROPS })
-  expect(await pane.find({ text: ' 4 files' })).toBeDefined()
-  expect(await pane.find({ text: 'DEL' })).toBeDefined()
-  expect(await pane.find({ text: 'NEW' })).toBeDefined()
+  expect(await pane.find({ text: '4 files changed' })).toBeDefined()
+  expect(await pane.find({ text: ' D ' })).toBeDefined()
+  expect(await pane.find({ text: ' A ' })).toBeDefined()
   await pane.unmount()
 })
 
@@ -276,6 +280,57 @@ test('outside a git repo, shell commands still show their round, with a warning'
   await $.tool.call({ tool: 'Bash', command: 'mv a.json b.json' })
 
   const pane = await $.ui.mount({ plugin: 'round-changes', surface: 'terminal', component: 'Pane', requestId: 'round-changes', props: PANE_PROPS })
-  expect(await pane.find({ text: /^⚠ Not a git repo: 1 shell command may have changed files/ })).toBeDefined()
+  expect(await pane.find({ text: /^⚠ 1 shell command ran outside a git repo, so its changes can't be shown\. Run git init to track them\.$/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('a repo made mid-session (git init) is found at the next shell command', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-07T12:00:00Z') })
+  let isRepo = false
+  let trees = 0
+  on('session.cwd', () => ({ value: '/later' }))
+  on('process.run', ($, e) => {
+    const argv = [...e.argv]
+    const out = (stdout: string, exitCode = 0) => ({
+      value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    })
+    if (argv[1] === 'rev-parse') return isRepo ? out('/later\n/later/.git\n') : out('', 128)
+    if (argv[0] === 'sh' && argv[2]?.includes('write-tree')) return out(`${String(++trees).repeat(40)}\n`)
+    if (argv.includes('diff')) return out(GIT_DIFF)
+    return out('')
+  })
+  on('tool.call', () => ({ result: { stdout: '', stderr: '', interrupted: false } }))
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  isRepo = true
+  await $.tool.call({ tool: 'Bash', command: "sed -i 's/b/B/' src/x.txt && rm y.txt && echo new > z.txt" })
+
+  const pane = await $.ui.mount({ plugin: 'round-changes', surface: 'terminal', component: 'Pane', requestId: 'round-changes', props: PANE_PROPS })
+  expect(await pane.find({ text: '4 files changed' })).toBeDefined()
+  await pane.unmount()
+})
+
+test('a scrolled viewer offers the top once scrolled down and the bottom only while more is below', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-07T12:00:00Z') })
+  on('tool.call', ($, e) =>
+    e.tool === 'Edit'
+      ? { result: { filePath: e.file_path, oldString: '', newString: '', originalFile: 'x', structuredPatch: [HUNK], userModified: false, replaceAll: false } }
+      : { deny: 'not in this test' },
+  )
+  for (const f of ['a', 'b', 'c', 'd']) await $.tool.call({ tool: 'Edit', file_path: `/repo/${f}.ts`, old_string: 'old', new_string: 'new' })
+
+  const short = { ...PANE_PROPS, scroll: { offset: 0, bodyRows: 5 } }
+  const pane = await $.ui.mount({ plugin: 'round-changes', surface: 'terminal', component: 'Pane', requestId: 'round-changes', props: short })
+  expect(await pane.find({ key: 'bottom' })).toBeDefined()
+  expect(await pane.find({ key: 'top' })).toBeUndefined()
+
+  // At the end: back to the top, nothing more below.
+  await pane.redraw({ ...short, scroll: { offset: 100, bodyRows: 5 } })
+  expect(await pane.find({ key: 'top' })).toBeDefined()
+  expect(await pane.find({ key: 'bottom' })).toBeUndefined()
+
+  // A tree that fits shows neither.
+  await pane.redraw({ ...short, scroll: { offset: 0, bodyRows: 40 } })
+  expect(await pane.find({ key: 'top' })).toBeUndefined()
+  expect(await pane.find({ key: 'bottom' })).toBeUndefined()
   await pane.unmount()
 })
