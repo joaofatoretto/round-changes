@@ -1,11 +1,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ToolCallInput, ToolCallResult } from 'claude-code'
 
-import type { Change, FileTouch, Live, Round, View } from '../types'
+import type { Change, Desktop, FileTouch, Live, Round, View } from '../types'
 import {
+  FILE_MANAGER,
   auditCommand,
-  auditFitsBeside,
-  auditLabel,
   clock,
   diffScreenRows,
   diffSource,
@@ -13,6 +12,7 @@ import {
   duration,
   fileRowLabel,
   fileStats,
+  fitButtons,
   fitFor,
   fromToolRecord,
   makeChange,
@@ -20,6 +20,8 @@ import {
   keepStart,
   promptLine,
   recordChange,
+  revealCommand,
+  roundButtons,
   roundForDuration,
   countShell,
   roundStats,
@@ -51,6 +53,7 @@ const view = atom({ plugin: 'round-changes', key: 'view' } as const, { roundId: 
 const cwd = atom({ plugin: 'round-changes', key: 'cwd' } as const, '')
 const home = atom({ plugin: 'round-changes', key: 'home' } as const, '')
 const scroll = atom({ plugin: 'round-changes', key: 'scroll' } as const, null)
+const desktop = atom({ plugin: 'round-changes', key: 'desktop' } as const, null)
 
 /** Git's colors for added and removed lines, as GitHub draws them. */
 const ADDED = '#3fb950'
@@ -200,7 +203,7 @@ async function show($: EngineInterface, next: View) {
   await update($, view, () => next)
   const list = await read($, rounds)
   const round = shownRound(list, next)
-  const rows = Math.min(40, Math.max(6, wantedRows(round, shownFile(round, next), next.screen)))
+  const rows = Math.min(40, Math.max(6, wantedRows(round, shownFile(round, next), next.screen, undefined, await desktopFor($))))
   // Docked (fullscreen, 110+ columns) it takes a slim column on the right; inline, the rows it needs.
   return $.ui.open({ id: PANE, title: TITLE, focus: true, closeOnEscape: true, rows, columns: DOCK_COLUMNS })
 }
@@ -241,9 +244,14 @@ async function openInEditor($: EngineInterface, path: string, line: number) {
   }
 }
 
+/** The project a round belongs to: the repo's top, else the folder the session runs in. */
+async function projectFolder($: EngineInterface) {
+  return (await repoFor($))?.top ?? (await $.session.cwd())
+}
+
 /** Opens the project in VS Code with the round's files, where the gutter marks what git sees changed. */
 async function auditInEditor($: EngineInterface, round: Round) {
-  const folder = (await repoFor($))?.top ?? (await $.session.cwd())
+  const folder = await projectFolder($)
   const { argv, opened, left } = auditCommand(EDITOR, folder, round.files)
   try {
     const ran = await $.process.run(argv, { timeoutMs: 20_000 })
@@ -256,6 +264,46 @@ async function auditInEditor($: EngineInterface, round: Round) {
     }
   } catch {
     $.ui.toast(`Could not run \`${EDITOR}\`. Is the VS Code CLI on your PATH?`)
+  }
+}
+
+/** Where the session runs, found once: it picks the file manager and how paths reach it. */
+async function desktopFor($: EngineInterface): Promise<Desktop> {
+  const known = await read($, desktop)
+  if (known) return known
+  let found: Desktop
+  try {
+    const wsl = await $.env.get('WSL_DISTRO_NAME')
+    found = wsl ? 'wsl' : (await $.process.run(['uname', '-s'], QUICK)).stdout.trim() === 'Darwin' ? 'mac' : 'linux'
+  } catch {
+    // No `uname`: Windows itself.
+    found = 'windows'
+  }
+  await update($, desktop, () => found)
+  return found
+}
+
+/** Shows `path` in the file manager: a folder opened, a file selected in its folder. */
+async function openInFiles($: EngineInterface, path: string, isFolder: boolean) {
+  const where = await desktopFor($)
+  const fm = FILE_MANAGER[where]
+  const name = splitPath(path).name || path
+  try {
+    // File Explorer takes Windows paths: `\\wsl.localhost\…` for a file inside WSL.
+    const target = where === 'wsl' ? (await $.process.run(['wslpath', '-w', path], QUICK)).stdout.trim() : path
+    if (!target) {
+      $.ui.toast(`Could not find ${name} as a Windows path`)
+      return
+    }
+    const ran = await $.process.run(revealCommand(where, target, isFolder), { timeoutMs: 20_000 })
+    // File Explorer exits with 1 even when it opened.
+    if (ran.exitCode === 0 || fm.short === 'Explorer') $.ui.toast(`Opened ${name} in ${fm.name}`, { timeoutMs: 2500 })
+    else {
+      const why = (ran.stderr || ran.stdout).trim().split('\n')[0] || `exit code ${ran.exitCode}`
+      $.ui.toast(`The ${fm.name} did not open ${name}: ${why}`)
+    }
+  } catch {
+    $.ui.toast(`Could not open the ${fm.name}.`)
   }
 }
 
@@ -277,12 +325,13 @@ export const register: Register = on => {
     const result = await next(e)
     await $.command.register({
       name: 'changes',
-      description: 'Review what the last round changed: files, diffs, open in VS Code',
+      description: 'Review what the last round changed: files, diffs, open in VS Code or the file manager',
     })
     const root = await $.session.cwd()
     await update($, cwd, () => root)
     const homeDir = (await $.env.get('HOME')) ?? ''
     await update($, home, () => homeDir)
+    await desktopFor($)
     // The first version pinned a status line; the chips replace it.
     $.ui.status(undefined)
     await backfill($)
@@ -451,6 +500,9 @@ export const register: Register = on => {
     const room = width - 2
     const fit = fitFor(width)
     const round = shownRound(list, v)
+    // Found at session start and before the viewer opens: drawing can't store it.
+    const desk = (await read($, desktop)) ?? 'linux'
+    const fm = FILE_MANAGER[desk]
 
     /** A file's kind as a 3-cell chip: A added, M modified, D deleted. */
     const kindBadge = (kind: FileTouch['kind']) => (
@@ -592,14 +644,17 @@ export const register: Register = on => {
         </Box>
       )
 
-      // The two things to do with the file.
-      const openLabel = fit === 'narrow' ? 'VS Code' : 'Open in VS Code'
-      const chatLabel = fit === 'narrow' ? 'chat' : 'Find in chat'
-      const actions = (!isGone || canReveal) && (
+      // The things to do with the file. A deleted one shows its folder in the file manager.
+      const labels = fitButtons(room, {
+        ...(isGone ? {} : { open: ['Open in VS Code', 'VS Code'] as const }),
+        ...(canReveal ? { chat: ['Find in chat', 'chat'] as const } : {}),
+        files: [`Open in ${fm.name}`, fm.short],
+      })
+      const actions = (
         <Box key="actions" flexDirection="row" gap={2} marginTop={1} width={room}>
           {!isGone && (
             <Button key="open" hotkey="o" variant="primary" onPress={() => openInEditor($, file.path, file.changes[0]?.line ?? 1)}>
-              {openLabel}
+              {labels.open}
             </Button>
           )}
           {canReveal && (
@@ -611,9 +666,16 @@ export const register: Register = on => {
                 if (first) void revealInChat($, first)
               }}
             >
-              {chatLabel}
+              {labels.chat}
             </Button>
           )}
+          <Button
+            key="files"
+            hotkey="f"
+            onPress={() => (isGone ? openInFiles($, splitPath(file.path).dir, true) : openInFiles($, file.path, false))}
+          >
+            {labels.files}
+          </Button>
         </Box>
       )
 
@@ -709,6 +771,7 @@ export const register: Register = on => {
           {hints([
             ...(!isGone ? [['o', 'open'] as const] : []),
             ...(canReveal ? [['t', 'chat'] as const] : []),
+            ['f', 'files'],
             ...(many ? [['p/n', 'file'] as const] : []),
             ...(scrolls(estimate) ? [['g/e', 'top/end'] as const] : []),
             ['esc', 'back'],
@@ -790,15 +853,22 @@ export const register: Register = on => {
       </Box>
     )
 
-    // The round as a whole, in the editor: every file it left in place, beside git's markers.
-    // At the right end of the summary line, or under it when the line has no room.
-    const canAudit = round.files.some(f => f.kind !== 'deleted')
-    const auditButton = canAudit && (
-      <Button key="audit" hotkey="a" variant="primary" onPress={() => auditInEditor($, round)}>
-        {auditLabel(width)}
-      </Button>
+    // The round as a whole, in the editor (every file it left in place, beside git's markers)
+    // and the project in the file manager. At the right end of the summary line, or under it.
+    const buttons = roundButtons(round, width, desk)
+    const canAudit = buttons.audit !== undefined
+    const projectButtons = (
+      <Box key="buttons" flexDirection="row" gap={2} flexShrink={0}>
+        {canAudit && (
+          <Button key="audit" hotkey="a" variant="primary" onPress={() => auditInEditor($, round)}>
+            {buttons.audit}
+          </Button>
+        )}
+        <Button key="project-files" hotkey="f" onPress={async () => openInFiles($, await projectFolder($), true)}>
+          {buttons.files}
+        </Button>
+      </Box>
     )
-    const isAuditBeside = canAudit && auditFitsBeside(round, width)
     const summary = (
       <Box key="summary" flexDirection="row" justifyContent="space-between" marginTop={1} width={room}>
         <Box key="totals" flexDirection="row" gap={1}>
@@ -808,12 +878,12 @@ export const register: Register = on => {
           {stats.added > 0 && <Text key="a" color={ADDED}>{`+${stats.added}`}</Text>}
           {stats.removed > 0 && <Text key="r" color={REMOVED}>{`−${stats.removed}`}</Text>}
         </Box>
-        {isAuditBeside && auditButton}
+        {buttons.isBeside && projectButtons}
       </Box>
     )
-    const audit = canAudit && !isAuditBeside && (
-      <Box key="audit" flexDirection="row" marginTop={1} width={room}>
-        {auditButton}
+    const actions = !buttons.isBeside && (
+      <Box key="actions" flexDirection="row" marginTop={1} width={room}>
+        {projectButtons}
       </Box>
     )
 
@@ -876,7 +946,7 @@ export const register: Register = on => {
         {nav}
         {prompt}
         {summary}
-        {audit}
+        {actions}
         {n > 0 && (
           <Box key="files" flexDirection="column" marginTop={1} width={room}>
             {rows}
@@ -886,6 +956,7 @@ export const register: Register = on => {
         {hints([
           ...(n > 0 ? [[n === 1 ? '1' : `1-${Math.min(9, n)}`, 'open'] as const] : []),
           ...(canAudit ? [['a', 'audit'] as const] : []),
+          ['f', 'files'],
           ['p/n', 'round'],
           ...(scrolls(estimate) ? [['g/e', 'top/end'] as const] : []),
           ['esc', 'close'],

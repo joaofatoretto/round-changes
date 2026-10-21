@@ -25,6 +25,7 @@ Claude can change a dozen files in one reply, some with the Edit tool and some t
 - **Clear diffs:** syntax-highlighted, with line numbers, one section per edit, and the command that made each shell change.
 - **Open in VS Code:** jumps to the first changed line, in the window you already have open.
 - **Audit in VS Code:** opens the project with every file the round touched, so the editor's git markers and Source Control view show each change in place.
+- **Open in File Explorer:** shows a file selected in its folder, or the whole project, in File Explorer on Windows and WSL, Finder on macOS, or the file manager on Linux.
 - **Find in chat:** scrolls the conversation back to the tool call that made the change.
 - **Takes no space until you want it:** a chip on each round's "✻ Worked for…" line and a button in the prompt footer open the viewer. Neither adds a row.
 - **Fits small terminals:** the layout adapts from 46 columns up, and Esc puts it away.
@@ -93,6 +94,7 @@ The viewer takes the keyboard when it opens. Click it, or press `ctrl+x` then `t
 |---|---|
 | `1`–`9` | Open that file's diff (or click its row) |
 | `a` | Audit the round in VS Code |
+| `f` | Open the project in File Explorer |
 | `p` / `n` | Older / newer round |
 | `esc` | Close |
 
@@ -100,6 +102,7 @@ The viewer takes the keyboard when it opens. Click it, or press `ctrl+x` then `t
 |---|---|
 | `o` | Open in VS Code at the changed line |
 | `t` | Find the change in the chat |
+| `f` | Show the file in File Explorer (its folder, if it was deleted) |
 | `p` / `n` | Previous / next file in the round |
 | `g` / `e` | Jump to the top / bottom of a long diff |
 | `↑` `↓` | Scroll |
@@ -142,6 +145,8 @@ Round Changes makes no network requests and calls no model.
 | Around each shell command | `git add -A` and `git write-tree` with the private index, then `git diff` between the two snapshots |
 | When you press Open in VS Code | `code -r -g <file>:<line>` |
 | When you press Audit in VS Code | `code <project> -g <file>:<line> …` (up to 25 files) |
+| Once, at session start | `uname -s`, to pick the file manager (skipped on WSL, found from `WSL_DISTRO_NAME`) |
+| When you press Open in File Explorer | WSL: `wslpath -w`, then `explorer.exe /select,<file>` or `explorer.exe <project>`. macOS: `open -R <file>` or `open <project>`. Linux: `xdg-open <folder>` |
 
 Rounds live in the session's memory and end with it. When the mod loads in a session that's already running, it rebuilds earlier rounds from the transcript.
 
@@ -150,6 +155,7 @@ Rounds live in the session's memory and end with it. When the mod loads in a ses
 - **Claude Code:** built and tested on 2.1.293.
 - **git:** to capture shell changes.
 - **VS Code's `code` command** on your `PATH`, for Open in VS Code. In VS Code, run *Shell Command: Install 'code' command in PATH*. On WSL it works out of the box.
+- **A file manager:** File Explorer, Finder, or one `xdg-open` starts on Linux.
 - **Clicking** needs a terminal that passes mouse clicks to Claude Code (its fullscreen layout). The keys work everywhere.
 
 ## Limitations
@@ -162,6 +168,7 @@ Rounds live in the session's memory and end with it. When the mod loads in a ses
 - Changes made by subagents are listed, but Find in chat can't open a subagent's transcript.
 - The footer button hides when the footer row is too narrow, below about 64 columns. The chip and `/changes` still work.
 - Only VS Code is supported for Open in editor.
+- On Linux, Open in file manager opens the file's folder without selecting the file.
 
 ## Development
 

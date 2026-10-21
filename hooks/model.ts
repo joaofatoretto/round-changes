@@ -1,4 +1,4 @@
-import type { Change, FileTouch, Hunk, Live, Round, View } from '../types'
+import type { Change, Desktop, FileTouch, Hunk, Live, Round, View } from '../types'
 
 /** Diff lines kept per change; past this the diff is cut and says so. */
 export const MAX_LINES = 400
@@ -269,15 +269,54 @@ const bodyRoom = (width: number) => Math.max(22, width - 2)
 export const summaryText = (files: number) =>
   files > 0 ? `${files} file${files === 1 ? '' : 's'} changed` : 'No file changes recorded'
 
-export const auditLabel = (width: number) => (fitFor(width) === 'narrow' ? 'Audit' : 'Audit in VS Code')
+/** Each desktop's file manager, and its name where a row is short. */
+export const FILE_MANAGER: Record<Desktop, { name: string; short: string }> = {
+  wsl: { name: 'File Explorer', short: 'Explorer' },
+  windows: { name: 'File Explorer', short: 'Explorer' },
+  mac: { name: 'Finder', short: 'Finder' },
+  linux: { name: 'file manager', short: 'Files' },
+}
 
-/** Whether the audit button fits at the right end of the summary line; if not, it takes a row under it. */
-export const auditFitsBeside = (round: Round, width: number): boolean => {
+/**
+ * The command that shows `path` in the file manager: a folder opened, a file selected
+ * in its folder. Linux has no common way to select a file, so its folder opens. On WSL
+ * `path` is already the Windows path.
+ */
+export const revealCommand = (desktop: Desktop, path: string, isFolder: boolean): string[] => {
+  if (desktop === 'wsl' || desktop === 'windows') return isFolder ? ['explorer.exe', path] : ['explorer.exe', `/select,${path}`]
+  if (desktop === 'mac') return isFolder ? ['open', path] : ['open', '-R', path]
+  return ['xdg-open', isFolder ? path : splitPath(path).dir || '/']
+}
+
+/** The cells a row of buttons takes: `[ label ]` each, two apart. */
+export const buttonsWidth = (labels: readonly string[]) =>
+  labels.reduce((n, l) => n + l.length + 4, 0) + 2 * Math.max(0, labels.length - 1)
+
+/** Each button's long label, the last ones shortened first until the row fits `room`. */
+export const fitButtons = (room: number, buttons: Record<string, readonly [long: string, short: string]>): Record<string, string> => {
+  const ids = Object.keys(buttons)
+  const labels = Object.fromEntries(ids.map(id => [id, buttons[id]![0]]))
+  for (let i = ids.length - 1; i >= 0 && buttonsWidth(Object.values(labels)) > room; i--) labels[ids[i]!] = buttons[ids[i]!]![1]
+  return labels
+}
+
+/**
+ * The round's buttons: audit while a file is left to open, then the project in the file
+ * manager. They sit at the right end of the summary line when they fit; if not, on a row under it.
+ */
+export const roundButtons = (round: Round, width: number, desktop: Desktop) => {
+  const fm = FILE_MANAGER[desktop]
+  const canAudit = round.files.some(f => f.kind !== 'deleted')
+  const room = bodyRoom(width)
+  const labels = fitButtons(room, {
+    ...(canAudit ? { audit: ['Audit in VS Code', 'Audit'] as const } : {}),
+    files: [`Open in ${fm.name}`, fm.short],
+  })
   const { added, removed, files } = roundStats(round)
   const summary =
     summaryText(files).length + (added > 0 ? `+${added}`.length + 1 : 0) + (removed > 0 ? `−${removed}`.length + 1 : 0)
-  // `[ label ]`, and two cells at least between it and the summary.
-  return summary + 2 + auditLabel(width).length + 4 <= bodyRoom(width)
+  // Two cells at least between the summary and the buttons.
+  return { audit: labels.audit, files: labels.files!, isBeside: summary + 2 + buttonsWidth(Object.values(labels)) <= room }
 }
 
 /**
@@ -289,6 +328,7 @@ export const wantedRows = (
   file: FileTouch | undefined,
   screen: View['screen'],
   width = 50,
+  desktop: Desktop = 'linux',
 ): number => {
   if (!round) return 6
   if (screen !== 'round' && file) return diffScreenRows(file, width)
@@ -299,10 +339,11 @@ export const wantedRows = (
     round.shellCommands > 0
       ? 1 + (narrow ? 1 : Math.ceil(shellWarning(round.shellCommands, round.isOutsideRepo === true, false).length / room))
       : 0
-  const hints = room >= 34 ? 1 : 2
-  const audit = round.files.some(f => f.kind !== 'deleted') && !auditFitsBeside(round, width) ? 2 : 0
-  // nav, blank, prompt, meta, blank, summary, [blank, audit], [blank, files], [blank, warning], blank, hints
-  return 2 + prompt + (narrow ? 0 : 1) + 2 + audit + (round.files.length > 0 ? 1 + round.files.length : 0) + warning + 1 + hints
+  // "1-9 open  a audit  f files  p/n round  esc close" is 48 cells.
+  const hints = room >= 48 ? 1 : 2
+  const buttons = roundButtons(round, width, desktop).isBeside ? 0 : 2
+  // nav, blank, prompt, meta, blank, summary, [blank, buttons], [blank, files], [blank, warning], blank, hints
+  return 2 + prompt + (narrow ? 0 : 1) + 2 + buttons + (round.files.length > 0 ? 1 + round.files.length : 0) + warning + 1 + hints
 }
 
 /** The finished round whose length matches a "Baked for" line, within a moment's drift. */

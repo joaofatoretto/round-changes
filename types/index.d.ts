@@ -64,6 +64,9 @@ export type Live = {
  */
 export type View = { roundId: string | null; file: string | null; screen: 'round' | 'file' }
 
+/** Where the session runs, for the file manager it opens: WSL opens Windows' File Explorer. */
+export type Desktop = 'wsl' | 'windows' | 'mac' | 'linux'
+
 declare module 'claude-code' {
   interface PluginState {
     'round-changes': {
@@ -75,6 +78,8 @@ declare module 'claude-code' {
       home: string
       /** The viewer's tree height as the engine measured it at the last scroll, and on which screen (`viewKey`). */
       scroll: { key: string; contentRows: number } | null
+      /** Where the session runs, found the first time a file manager is needed. */
+      desktop: Desktop | null
     }
   }
 }

@@ -4,15 +4,17 @@ import type { Live, Round } from '../types'
 import {
   addedHunk,
   auditCommand,
-  auditFitsBeside,
   capHunks,
   diffSource,
+  fitButtons,
   displayPath,
   firstChangedLine,
   makeChange,
   recordChange,
   roundsFromTranscript,
   parseGitDiff,
+  revealCommand,
+  roundButtons,
   mergeKind,
   shortDir,
   stepFile,
@@ -98,10 +100,14 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`pane lists the files a round touched and opens one in VS Code on ${surface}`, async ($, on) => {
     mock.clock(on, { now: Date.parse('2026-10-07T12:00:00Z') })
     on('session.cwd', () => ({ value: '/repo' }))
+    on('env.get', ($, e) => ({ value: e.name === 'WSL_DISTRO_NAME' ? 'Ubuntu' : undefined }))
     const opened: string[][] = []
     on('process.run', ($, e) => {
       opened.push([...e.argv])
-      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      // wslpath, as WSL answers for a file inside it; File Explorer exits 1 when it opened.
+      const stdout = e.argv[0] === 'wslpath' ? `\\\\wsl.localhost\\Ubuntu${String(e.argv[2]).replaceAll('/', '\\')}\n` : ''
+      const exitCode = e.argv[0] === 'explorer.exe' ? 1 : 0
+      return { value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     })
     on('ui.status', () => ({ value: undefined }))
     mock.store(on)
@@ -110,7 +116,11 @@ for (const surface of ['terminal', 'desktop'] as const) {
       resized.push(e.rows)
       return { value: { isPlaced: true as const } }
     })
-    on('ui.toast', () => ({ value: undefined }))
+    const toasts: string[] = []
+    on('ui.toast', ($, e) => {
+      toasts.push(e.text)
+      return { value: undefined }
+    })
     on('tool.call', ($, e) => {
       if (e.tool === 'Edit')
         return {
@@ -131,6 +141,11 @@ for (const surface of ['terminal', 'desktop'] as const) {
       return { deny: 'not in this test' }
     })
 
+    // Session start finds it runs on WSL.
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    on('command.register', () => ({ value: undefined }))
+    on('session.messages', () => ({ value: [] }))
+    await $.session.start({ cwd: '/repo', surface, isInteractive: true })
     await $.tool.call({ tool: 'Edit', file_path: '/repo/src/theme.ts', old_string: 'old', new_string: 'new\nmore' })
     await $.tool.call({ tool: 'Write', file_path: '/repo/src/dark.css', content: 'body {}\n' })
 
@@ -155,6 +170,15 @@ for (const surface of ['terminal', 'desktop'] as const) {
     // Audit: the project in VS Code, each file at its first changed line.
     await pane.press({ key: 'audit' })
     expect(opened.at(-1)).toEqual(['code', '/repo', '-g', '/repo/src/theme.ts:42', '/repo/src/dark.css:1'])
+
+    // The project in File Explorer, by its Windows path.
+    expect(await pane.find({ text: 'Open in File Explorer' })).toBeDefined()
+    await pane.press({ key: 'project-files' })
+    expect(opened.slice(-2)).toEqual([
+      ['wslpath', '-w', '/repo'],
+      ['explorer.exe', '\\\\wsl.localhost\\Ubuntu\\repo'],
+    ])
+    expect(toasts.at(-1)).toBe('Opened repo in File Explorer')
     opened.length = 0
 
     // A file opens its own screen: badge, actions, the diff.
@@ -165,6 +189,10 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
     await pane.press({ key: 'open' })
     expect(opened).toEqual([['code', '-r', '-g', '/repo/src/dark.css:1']])
+
+    // The file selected in its folder.
+    await pane.press({ key: 'files' })
+    expect(opened.at(-1)).toEqual(['explorer.exe', '/select,\\\\wsl.localhost\\Ubuntu\\repo\\src\\dark.css'])
 
     await pane.press({ key: 'prev-file' })
     expect(await pane.find({ text: '· line 42' })).toBeDefined()
@@ -263,14 +291,35 @@ test('an audit opens the folder and the files still there, at most a cap of them
   expect(auditCommand('code', '/r', files, 2)).toEqual({ argv: ['code', '/r', '-g', '/r/a.ts:42', '/r/b.ts:3'], opened: 2, left: 1 })
 })
 
-test('the audit button sits on the summary line until the line is too narrow', () => {
+test('the round buttons sit on the summary line while they fit, shortened from the last', () => {
   let rounds: Round[] = []
   for (const f of ['a', 'b']) rounds = recordChange(rounds, live('t1', 1), `/r/${f}.ts`, 'modified', change(f))
   const round = rounds[0]!
-  // "2 files changed +4 −2" with "[ Audit in VS Code ]" at 50 columns, "[ Audit ]" at 40.
-  expect(auditFitsBeside(round, 50)).toBe(true)
-  expect(auditFitsBeside(round, 40)).toBe(true)
-  expect(auditFitsBeside(round, 30)).toBe(false)
+  // "2 files changed +4 −2", then "[ Audit in VS Code ]  [ Open in File Explorer ]": 70 cells.
+  expect(roundButtons(round, 80, 'wsl')).toEqual({ audit: 'Audit in VS Code', files: 'Open in File Explorer', isBeside: true })
+  // Docked: a row of their own, still whole.
+  expect(roundButtons(round, 50, 'wsl')).toEqual({ audit: 'Audit in VS Code', files: 'Open in File Explorer', isBeside: false })
+  expect(roundButtons(round, 40, 'wsl')).toEqual({ audit: 'Audit in VS Code', files: 'Explorer', isBeside: false })
+  expect(roundButtons(round, 30, 'mac')).toEqual({ audit: 'Audit', files: 'Finder', isBeside: false })
+  // Only deleted files: nothing to audit, the project still opens.
+  const gone = { ...round, files: round.files.map(f => ({ ...f, kind: 'deleted' as const })) }
+  expect(roundButtons(gone, 80, 'linux')).toEqual({ audit: undefined, files: 'Open in file manager', isBeside: true })
+})
+
+test('the file manager selects a file, opens a folder', () => {
+  expect(revealCommand('wsl', 'C:\\r\\a.ts', false)).toEqual(['explorer.exe', '/select,C:\\r\\a.ts'])
+  expect(revealCommand('wsl', 'C:\\r', true)).toEqual(['explorer.exe', 'C:\\r'])
+  expect(revealCommand('mac', '/r/a.ts', false)).toEqual(['open', '-R', '/r/a.ts'])
+  expect(revealCommand('mac', '/r', true)).toEqual(['open', '/r'])
+  expect(revealCommand('linux', '/r/src/a.ts', false)).toEqual(['xdg-open', '/r/src'])
+  expect(revealCommand('linux', '/a.ts', false)).toEqual(['xdg-open', '/'])
+})
+
+test('a row of buttons keeps its first labels whole the longest', () => {
+  const buttons = { open: ['Open in VS Code', 'VS Code'], chat: ['Find in chat', 'chat'], files: ['Open in File Explorer', 'Explorer'] } as const
+  expect(fitButtons(64, buttons)).toEqual({ open: 'Open in VS Code', chat: 'Find in chat', files: 'Open in File Explorer' })
+  expect(fitButtons(48, buttons)).toEqual({ open: 'Open in VS Code', chat: 'chat', files: 'Explorer' })
+  expect(fitButtons(38, buttons)).toEqual({ open: 'VS Code', chat: 'chat', files: 'Explorer' })
 })
 
 test('a file created then deleted in one round reads deleted', () => {
