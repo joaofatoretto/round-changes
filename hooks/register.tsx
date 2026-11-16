@@ -107,30 +107,64 @@ async function recordFileTool<E extends ToolCallInput, R extends ToolCallResult>
 
 /**
  * Snapshots of a git work tree, to see what a shell command changed: the tree
- * before and after, each written with `git add -A` into a private index inside
- * `.git` (never the person's staging area), then diffed.
+ * before and after, each written with `git add -A` into a private index, then
+ * diffed. Everything a snapshot writes (the index, and the blobs and trees of
+ * changed or untracked files) goes into a folder of this run's own under
+ * `.git/round-changes/`, never the person's staging area or `.git/objects`:
+ * the repo's objects are only read (`GIT_ALTERNATE_OBJECT_DIRECTORIES`), so
+ * unchanged files cost nothing. Before 0.3.1 they went into `.git/objects` and
+ * piled up there by the thousand, unreachable, until `git gc` gave up with
+ * "too many unreachable loose objects".
+ *
+ * The folder is deleted when the session ends; one a crashed run left behind
+ * is deleted by the next run that finds it a day old.
  */
-type Repo = { top: string; index: string }
+type Repo = { top: string; index: string; objects: string; store: string; dir: string }
 
 const QUICK = { timeoutMs: 10_000 }
 
+/** This run's folder name: snapshots of two sessions in one repo never share an index. */
+const RUN = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+
+/** A run folder untouched this long belongs to a run that is gone (each snapshot touches its own). */
+const STALE_MINUTES = 24 * 60
+
 /** The repo the session works in, or null outside one. */
 async function findRepo($: EngineInterface, cwd: string): Promise<Repo | null> {
-  const found = await $.process.run(['git', 'rev-parse', '--show-toplevel', '--absolute-git-dir'], { cwd, ...QUICK })
+  const found = await $.process.run(['git', 'rev-parse', '--show-toplevel', '--absolute-git-dir', '--git-path', 'objects'], {
+    cwd,
+    ...QUICK,
+  })
   if (found.exitCode !== 0) return null
-  const [top, gitDir] = found.stdout.trim().split('\n')
+  const [top, gitDir, objectsPath] = found.stdout.trim().split('\n')
   if (!top || !gitDir) return null
-  const index = `${gitDir}/round-changes.index`
-  // Seeded from the real index, so its stat cache is warm and the first snapshot is quick.
-  await $.process.run(['sh', '-c', '[ -f "$1" ] || cp "$2/index" "$1" 2>/dev/null || true', 'sh', index, gitDir], QUICK)
-  return { top, index }
+  // `--git-path` answers relative to `cwd` (and follows worktrees and GIT_OBJECT_DIRECTORY).
+  const store = !objectsPath ? `${gitDir}/objects` : objectsPath.startsWith('/') ? objectsPath : `${cwd}/${objectsPath}`
+  const dir = `${gitDir}/round-changes/${RUN}`
+  // Seeded from the real index, so its stat cache is warm and the first snapshot is quick. The
+  // shared index of 0.3.0 and the folders of runs gone for a day are removed on the way.
+  const setup = [
+    'mkdir -p "$1/objects"',
+    '{ [ -f "$1/index" ] || cp "$2/index" "$1/index" 2>/dev/null || true; }',
+    'rm -f "$2/round-changes.index"',
+    `find "$2/round-changes" -mindepth 1 -maxdepth 1 -type d ! -name "$3" -mmin +${STALE_MINUTES} -exec rm -rf {} + 2>/dev/null`,
+    'true',
+  ].join('; ')
+  const made = await $.process.run(['sh', '-c', setup, 'sh', dir, gitDir, RUN], QUICK)
+  if (made.exitCode !== 0) return null
+  return { top, index: `${dir}/index`, objects: `${dir}/objects`, store, dir }
+}
+
+/** Where a snapshot's git commands write and read: the run's own index and objects, the repo's objects read-only. */
+function snapshotEnv(repo: Repo): Record<string, string> {
+  return { GIT_INDEX_FILE: repo.index, GIT_OBJECT_DIRECTORY: repo.objects, GIT_ALTERNATE_OBJECT_DIRECTORIES: repo.store }
 }
 
 /** The work tree as a tree id, untracked files included, ignored ones not. */
 async function snapshot($: EngineInterface, repo: Repo): Promise<string | undefined> {
   const ran = await $.process.run(['sh', '-c', 'git add -A . >/dev/null 2>&1; git write-tree'], {
     cwd: repo.top,
-    env: { GIT_INDEX_FILE: repo.index },
+    env: snapshotEnv(repo),
     ...QUICK,
   })
   const tree = ran.stdout.trim()
@@ -141,7 +175,7 @@ async function snapshot($: EngineInterface, repo: Repo): Promise<string | undefi
 async function diffTrees($: EngineInterface, repo: Repo, before: string, after: string): Promise<string> {
   const ran = await $.process.run(
     ['git', '-c', 'core.quotepath=false', 'diff', '--no-color', '--no-ext-diff', '--no-renames', '-U3', before, after],
-    { cwd: repo.top, ...QUICK },
+    { cwd: repo.top, env: snapshotEnv(repo), ...QUICK },
   )
   return ran.exitCode === 0 ? ran.stdout : ''
 }
@@ -163,6 +197,19 @@ async function repoFor($: EngineInterface): Promise<Repo | null> {
   } catch {
     return null
   }
+}
+
+/**
+ * Deletes this run's snapshot folders (the session ended; after a `/clear` the next command makes
+ * a fresh one). Queued behind any snapshot still running, since they share the folder.
+ */
+export async function dropSnapshots(
+  $: EngineInterface,
+  known: readonly Pick<Repo, 'dir'>[] = [...new Set(repos.values())],
+): Promise<void> {
+  repos.clear()
+  if (!known.length) return
+  await oneAtATime(() => $.process.run(['rm', '-rf', ...known.map(r => r.dir)], QUICK))
 }
 
 /** Drops a repo whose snapshot failed (moved, renamed, removed), so the next command looks again. */
@@ -336,6 +383,12 @@ export const register: Register = on => {
     $.ui.status(undefined)
     await backfill($)
     return result
+  })
+
+  // Snapshots are only needed while a command runs: nothing of them outlives the session.
+  on('session.end', async ($, e, next) => {
+    await dropSnapshots($).catch(() => undefined)
+    return next(e)
   })
 
   on('command.run', { command: 'changes' }, async $ => {

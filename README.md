@@ -122,7 +122,7 @@ Claude Code docks panels on the right only in its fullscreen layout at 110 colum
 
 The Edit and Write tools report exactly what they changed. A shell command doesn't, so in a git repo Round Changes takes two snapshots of the work tree around each shell command and diffs them:
 
-1. **Before the command:** `git add -A` and `git write-tree` into a **private index**, `.git/round-changes.index`. It's seeded from your real index, so each snapshot only re-reads the files that changed, and it takes milliseconds.
+1. **Before the command:** `git add -A` and `git write-tree` into a **private index** in a folder of the session's own, `.git/round-changes/<run>/`. It's seeded from your real index, so each snapshot only re-reads the files that changed, and it takes milliseconds.
 2. **After the command:** the same again, then `git diff` between the two trees.
 
 **Your files and git state are safe:** your working files, staging area, branches and history are never touched.
@@ -131,7 +131,7 @@ The Edit and Write tools report exactly what they changed. A shell command doesn
 
 - They follow your `.gitignore`.
 - They include untracked files, so new files show up.
-- They write file contents into `.git/objects` as unreferenced objects, which `git gc` removes in its normal cleanup.
+- What they write (the contents of changed and untracked files) goes into that same folder, not `.git/objects`: your repo's objects are only read. The folder is deleted when the session ends, and one a crashed session left behind is deleted a day later. Before 0.3.1 the snapshots went into `.git/objects`, where thousands of unreachable objects could pile up until `git gc` warned "too many unreachable loose objects"; 0.3.1 also removes the old `.git/round-changes.index`. To clear what an older version left, run `git prune` once.
 
 **Outside a git repo**, shell commands can't be diffed. The round says so in yellow ("no git"), so you know the list may be incomplete.
 
@@ -141,8 +141,9 @@ Round Changes makes no network requests and calls no model.
 
 | When | Command |
 |---|---|
-| Shell commands, until a repo is found | `git rev-parse` to find the repo. `cp` seeds the private index, once. |
-| Around each shell command | `git add -A` and `git write-tree` with the private index, then `git diff` between the two snapshots |
+| Shell commands, until a repo is found | `git rev-parse` to find the repo. `mkdir` and `cp` make the session's snapshot folder and seed its index, once; `rm`/`find` remove 0.3.0's index and day-old folders of other sessions. |
+| Around each shell command | `git add -A` and `git write-tree` with the private index and objects, then `git diff` between the two snapshots |
+| When the session ends | `rm -rf` on the session's snapshot folder |
 | When you press Open in VS Code | `code -r -g <file>:<line>` |
 | When you press Audit in VS Code | `code <project> -g <file>:<line> …` (up to 25 files) |
 | Once, at session start | `uname -s`, to pick the file manager (skipped on WSL, found from `WSL_DISTRO_NAME`) |

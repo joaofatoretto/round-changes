@@ -20,6 +20,7 @@ import {
   stepFile,
   stepRound,
 } from './model'
+import { dropSnapshots } from './register'
 
 const HUNK = {
   oldStart: 40,
@@ -411,4 +412,44 @@ test('a scrolled viewer offers the top once scrolled down and the bottom only wh
   expect(await pane.find({ key: 'top' })).toBeUndefined()
   expect(await pane.find({ key: 'bottom' })).toBeUndefined()
   await pane.unmount()
+})
+
+test('snapshots write only to their own folder, which goes when the session ends (0.3.1)', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-10-07T12:00:00Z') })
+  let trees = 0
+  const calls: Array<{ argv: string[]; env?: Record<string, string> }> = []
+  on('session.cwd', () => ({ value: '/repo/sub' }))
+  on('process.run', ($, e) => {
+    const argv = [...e.argv]
+    calls.push({ argv, env: e.init?.env as Record<string, string> | undefined })
+    const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (argv[1] === 'rev-parse') return out('/repo\n/repo/.git\n../.git/objects\n')
+    if (argv[0] === 'sh' && argv[2]?.includes('write-tree')) return out(`${String(++trees).repeat(40)}\n`)
+    if (argv.includes('diff')) return out(GIT_DIFF)
+    return out('')
+  })
+  on('tool.call', () => ({ result: { stdout: '', stderr: '', interrupted: false } }))
+  await $.tool.call({ tool: 'Bash', command: "sed -i 's/b/B/' src/x.txt" })
+
+  const snap = calls.find(c => c.argv[0] === 'sh' && c.argv[2]?.includes('write-tree'))
+  const dir = snap?.env?.GIT_INDEX_FILE?.replace(/\/index$/, '') ?? ''
+  expect(dir).toMatch(/^\/repo\/\.git\/round-changes\/[\w-]+$/)
+  expect(snap?.env).toEqual({
+    GIT_INDEX_FILE: `${dir}/index`,
+    GIT_OBJECT_DIRECTORY: `${dir}/objects`,
+    // The repo's own objects, read only (`--git-path` answers relative to the session's folder).
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: '/repo/sub/../.git/objects',
+  })
+  expect(calls.find(c => c.argv.includes('diff'))?.env).toEqual(snap?.env)
+  // Setting up removes 0.3.0's shared index and day-old folders of other runs.
+  const setup = calls.find(c => c.argv[0] === 'sh' && c.argv[2]?.includes('mkdir'))
+  expect(setup?.argv[2]).toContain('rm -f "$2/round-changes.index"')
+  expect(setup?.argv[2]).toContain('-mmin +1440')
+
+  // The harness runs its own copy of the module: the folder is handed over as the session.end hook's
+  // copy finds it, to a small fake `$`.
+  let removed: readonly string[] = []
+  const fake = { process: { run: async (argv: readonly string[]) => ((removed = argv), { exitCode: 0, stdout: '', stderr: '' }) } }
+  await dropSnapshots(fake as never, [{ dir }])
+  expect(removed).toEqual(['rm', '-rf', dir])
 })
